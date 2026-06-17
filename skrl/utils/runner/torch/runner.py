@@ -145,6 +145,10 @@ class Runner:
             multivariate_gaussian_model,
             shared_model,
         )
+        from skrl.utils.transformer_model_instantiators.torch import (
+            transformer_deterministic,
+            transformer_gaussian
+        )
 
         component = {
             # models
@@ -154,6 +158,8 @@ class Runner:
             "deterministicmixin": deterministic_model,
             "multivariategaussianmixin": multivariate_gaussian_model,
             "shared": shared_model,
+            "transformergaussian": transformer_gaussian,
+            "transformerdeterministic": transformer_deterministic,
             # memories
             "randommemory": RandomMemory,
             # agents
