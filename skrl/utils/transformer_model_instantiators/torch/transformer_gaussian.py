@@ -13,7 +13,8 @@ from skrl.models.torch import Model
 from skrl.utils.model_instantiators.torch.common import one_hot_encoding  # noqa
 from skrl.utils.model_instantiators.torch.common import generate_containers
 from skrl.utils.spaces.torch import unflatten_tensorized_space  # noqa
-from skrl.utils.transformer_utils.torch import DecoderNetwork, EncoderNetwork, TransformerNetwork
+from skrl.utils.transformer_utils.torch import TransformerNetwork
+from skrl.utils.transformer_utils.torch.utils import get_num_units
 
 
 def gaussian_model(
@@ -162,10 +163,14 @@ class TransformerGaussian(GaussianMixin, Model):
                  role="",
                  initial_log_std: float = 0,
                  fixed_log_std: bool = False,
-                 model_params={},
-                 pooling_method: Literal['mean', 'max', 'first', 'CLS', 'attn_mean'] = 'mean',
-                 tokenization_method: Literal['all', 'single', 'bin', 'groups',] = 'all',
-                 groups: Union[list[int], None] = None):
+                 network: list[dict[str, Any]] = [],
+                 output: str | list[str] = "",
+                 return_source: bool = False,
+                #  model_params={}, # This includes pooling_method, tokenization_method, and groups (if used for the tokenization)
+                #  pooling_method: Literal['mean', 'max', 'first', 'CLS', 'attn_mean'] = 'mean',
+                #  tokenization_method: Literal['all', 'single', 'bin', 'groups',] = 'all',
+                #  groups: Union[list[int], None] = None
+                 ):
         '''
         tokenization_method: 'all' puts the entire state into a single token, 'single' puts each input into a token, 'bin' uses predefined bins to create tokens for each input, 'groups' groups parts of the input together into a single token
         '''
@@ -186,17 +191,24 @@ class TransformerGaussian(GaussianMixin, Model):
             reduction=reduction,
             role=role,
         )
-
-        self.net = TransformerNetwork()
+        model_params = network[0]['model_params']
+        self.inp_type = network[0]['input']
+        inp_size = get_num_units(network[0]['input'], self.num_observations, self.num_states, self.num_actions)
+        out_size = get_num_units(output, self.num_observations, self.num_states, self.num_actions)
+        self.net = TransformerNetwork(inp_size, out_size, model_params)
+        total_params = sum(p.numel() for p in self.net.parameters())
+        print(f'\nTotal Policy Parameters: {total_params}\n')
 
         self.log_std_parameter = nn.Parameter(
-            torch.full(size=action_space.shape, fill_value=float(initial_log_std), dtype=torch.float32), requires_grad=not fixed_log_std
+            torch.full(size=(self.num_actions,), fill_value=float(initial_log_std), dtype=torch.float32), requires_grad=not fixed_log_std
         )
     
     def compute(self, inputs, role=""):
-        observations = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
-        states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
-        taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
-        inp = torch.cat([t for t in [observations, states, taken_actions] if t is not None], dim=1)
+        if self.inp_type == 'OBSERVATIONS':
+            inp = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
+        elif self.inp_type == 'STATES':
+            inp = unflatten_tensorized_space(self.state_space, inputs.get("states"))
+        elif self.inp_type == 'ACTIONS':
+            inp = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
         output = self.net(inp)
-        return output, {{"log_std": self.log_std_parameter}}
+        return output, {"log_std": self.log_std_parameter}

@@ -364,6 +364,7 @@ class PPO(Agent):
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
+        cumulative_avg_kl = 0
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):
@@ -451,7 +452,7 @@ class PPO(Agent):
                 cumulative_value_loss += value_loss.item()
                 if self.cfg.entropy_loss_scale:
                     cumulative_entropy_loss += entropy_loss.item()
-
+            cumulative_avg_kl += torch.tensor(kl_divergences, device=self.device).mean().item()
             # update learning rate
             if self.scheduler:
                 if isinstance(self.scheduler, KLAdaptiveLR):
@@ -475,6 +476,6 @@ class PPO(Agent):
             )
 
         self.track_data("Policy / Standard deviation", self.policy.distribution(role="policy").stddev.mean().item())
-
+        self.track_data("Learning / Avg KL", cumulative_avg_kl / self.cfg.learning_epochs)
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
