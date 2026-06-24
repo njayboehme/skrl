@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Any, Literal, Union
 from skrl.utils.transformer_utils.torch.decoder import DecoderNetwork
-from skrl.utils.transformer_utils.torch.encoder import EncoderNetwork
+from skrl.utils.transformer_utils.torch.encoder import EncoderNetwork, AdaptiveEncoderNetwork
 from skrl.utils.transformer_utils.torch.embedder import Embedder
 from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoProcessor, AutoImageProcessor
 
@@ -36,9 +36,20 @@ class TransformerNetwork(nn.Module):
             self.pretrained_network = AutoModel.from_config(self.config)
         
         # Trainable Network
+        use_adaptive_encoder = model_params['use_adaptive']
+        zero_out = model_params['zero_out']
         # Encoder
         if model_params['use_encoder']:
-            self.enc = EncoderNetwork(model_params)
+            if not use_adaptive_encoder:
+                self.enc = EncoderNetwork(model_params)
+            else:
+                self.enc = AdaptiveEncoderNetwork(model_params)
+                if zero_out:
+                    for l in self.enc.encoder.layers:
+                        nn.init.constant_(l.adaln[-1].weight, 0)
+                        nn.init.constant_(l.adaln[-1].bias, 0)
+                    nn.init.constant_(self.output_layer.linear.weight, 0)
+                    nn.init.constant_(self.output_layer.linear.bias, 0)
         # Decoder
         if model_params['use_decoder']:
             self.dec = DecoderNetwork(model_params)
