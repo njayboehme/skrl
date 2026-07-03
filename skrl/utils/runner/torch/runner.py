@@ -149,9 +149,12 @@ class Runner:
         #     transformer_deterministic,
         #     transformer_gaussian
         # )
+        # Policies
         from skrl.utils.transformer_model_instantiators.torch.transformer_deterministic import TransformerDeterministic
         from skrl.utils.transformer_model_instantiators.torch.transformer_gaussian import TransformerGaussian
-
+        # Algorithms
+        from skrl.agents.torch.ppo import PPO_Max, PPO_CFG_MAX
+        
         component = {
             # models
             "gaussianmixin": gaussian_model,
