@@ -190,6 +190,9 @@ class Runner:
             "td3_cfg": TD3_CFG,
             "trpo": TRPO,
             "trpo_cfg": TRPO_CFG,
+            # Custom algos
+            "ppo_max": PPO_Max,
+            "ppo_max_cfg": PPO_CFG_MAX,
             # multi-agents
             "ippo": IPPO,
             "ippo_cfg": IPPO_CFG,
