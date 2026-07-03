@@ -190,8 +190,6 @@ class Runner:
             "ippo_cfg": IPPO_CFG,
             "mappo": MAPPO,
             "mappo_cfg": MAPPO_CFG,
-            "ppo_max": PPO_Max,
-            "ppo_max_cfg": PPO_CFG_MAX,
             # trainers
             "sequentialtrainer": SequentialTrainer,
             "sequentialtrainer_cfg": SequentialTrainerCfg,
