@@ -145,12 +145,11 @@ class Runner:
             multivariate_gaussian_model,
             shared_model,
         )
-        # from skrl.utils.transformer_model_instantiators.torch import (
-        #     transformer_deterministic,
-        #     transformer_gaussian
-        # )
+        # Import Transformer Policies
         from skrl.utils.transformer_model_instantiators.torch.transformer_deterministic import TransformerDeterministic
         from skrl.utils.transformer_model_instantiators.torch.transformer_gaussian import TransformerGaussian
+        # Import Algorithms
+        from skrl.agents.torch.ppo import PPO_Max, PPO_CFG_MAX
 
         component = {
             # models
@@ -192,6 +191,8 @@ class Runner:
             "ippo_cfg": IPPO_CFG,
             "mappo": MAPPO,
             "mappo_cfg": MAPPO_CFG,
+            "ppo_max": PPO_Max,
+            "ppo_max_cfg": PPO_CFG_MAX,
             # trainers
             "sequentialtrainer": SequentialTrainer,
             "sequentialtrainer_cfg": SequentialTrainerCfg,
@@ -471,7 +472,7 @@ class Runner:
                 "reply_buffer": reply_buffer,
                 "collect_reference_motions": lambda num_samples: env.collect_reference_motions(num_samples),
             }
-        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo"]:
+        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo", "ppo_max"]:
             agent_id = possible_agents[0]
             agent_cfg = dataclasses.asdict(self._component(f"{agent_class}_CFG")(**self._process_cfg(cfg["agent"])))
             agent_cfg.get("observation_preprocessor_kwargs", {}).update(

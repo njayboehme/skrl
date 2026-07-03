@@ -327,6 +327,10 @@ class PPO(Agent):
 
         # write tracking data and checkpoints
         super().post_interaction(timestep=timestep, timesteps=timesteps)
+    
+    def explained_variance(self, y_pred, y_true):
+        var_y = torch.var(y_true)
+        return torch.nan if var_y == 0 else 1 - torch.var(y_true - y_pred) / var_y
 
     def update(self, *, timestep: int, timesteps: int) -> None:
         """Algorithm's main update step.
@@ -365,6 +369,11 @@ class PPO(Agent):
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
         cumulative_avg_kl = 0
+
+        explained_variance = self.explained_variance(self.memory.get_tensor_by_name("values"), self.memory.get_tensor_by_name("returns")).item()
+        rews = self.memory.get_tensor_by_name("rewards")
+        avg_rews = rews.mean()
+        std_rews = rews.std()
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):
@@ -470,6 +479,7 @@ class PPO(Agent):
             "Loss / Policy loss", cumulative_policy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
         )
         self.track_data("Loss / Value loss", cumulative_value_loss / (self.cfg.learning_epochs * self.cfg.mini_batches))
+        self.track_data("Loss / Explained Variance", explained_variance)
         if self.cfg.entropy_loss_scale:
             self.track_data(
                 "Loss / Entropy loss", cumulative_entropy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
