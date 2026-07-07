@@ -1,2 +1,3 @@
 from skrl.utils.transformer_model_instantiators.torch.transformer_deterministic import TransformerDeterministic
 from skrl.utils.transformer_model_instantiators.torch.transformer_gaussian import TransformerGaussian
+from skrl.utils.transformer_model_instantiators.torch.transformer_shared import TransformerShared

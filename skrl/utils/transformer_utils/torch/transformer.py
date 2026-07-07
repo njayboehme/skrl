@@ -8,7 +8,7 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoProcessor, Au
 
 
 class TransformerNetwork(nn.Module):
-    def __init__(self, input_size, output_size, model_params, *args, **kwargs):
+    def __init__(self, input_size, model_params, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Embeddings for proprioception
         self.proprioception_embeds = Embedder(input_size, model_params)
@@ -21,7 +21,7 @@ class TransformerNetwork(nn.Module):
             )
 
         # Project pooled token into action space
-        self.output_layer = nn.Linear(model_params['d_model'], output_size)
+        # self.output_layer = nn.Linear(model_params['d_model'], output_size)
 
         # Frozen Network
         self.preprocessor = None
@@ -48,8 +48,8 @@ class TransformerNetwork(nn.Module):
                     for l in self.enc.encoder.layers:
                         nn.init.constant_(l.adaln[-1].weight, 0)
                         nn.init.constant_(l.adaln[-1].bias, 0)
-                    nn.init.constant_(self.output_layer.linear.weight, 0)
-                    nn.init.constant_(self.output_layer.linear.bias, 0)
+                    # nn.init.constant_(self.output_layer.linear.weight, 0)
+                    # nn.init.constant_(self.output_layer.linear.bias, 0)
         # Decoder
         if model_params['use_decoder']:
             self.dec = DecoderNetwork(model_params)
@@ -107,4 +107,5 @@ class TransformerNetwork(nn.Module):
             x = self.dec(x)
         
         x = self.pool(x)
-        return self.output_layer(x)
+        # return self.output_layer(x)
+        return x

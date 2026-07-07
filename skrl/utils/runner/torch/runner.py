@@ -148,6 +148,8 @@ class Runner:
         # Import Transformer Policies
         from skrl.utils.transformer_model_instantiators.torch.transformer_deterministic import TransformerDeterministic
         from skrl.utils.transformer_model_instantiators.torch.transformer_gaussian import TransformerGaussian
+        from skrl.utils.transformer_model_instantiators.torch.transformer_shared import TransformerShared
+        
         # Import Algorithms
 
         component = {
@@ -160,6 +162,7 @@ class Runner:
             "shared": shared_model,
             "transformergaussian": TransformerGaussian,
             "transformerdeterministic": TransformerDeterministic,
+            "transformershared": TransformerShared,
             # memories
             "randommemory": RandomMemory,
             # agents
@@ -345,7 +348,11 @@ class Runner:
                     del models_cfg[role]["class"]
                     structure.append(model_structure)
                     parameters.append(self._process_cfg(models_cfg[role]))
-                model_class = self._component("Shared")
+                if str.startswith(structure[0].lower(), 'transformer'):
+                    model_class = 'TransformerShared'
+                else:
+                    model_class = 'Shared'
+                model_class = self._component(model_class)
                 # print model source
                 if self._verbose:
                     source = model_class(
