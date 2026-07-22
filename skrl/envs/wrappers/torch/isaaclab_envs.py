@@ -24,6 +24,7 @@ class IsaacLabWrapper(Wrapper):
         self._observations = None
         self._states = None
         self._info = {}
+        self._action_chunk_size = 1 if not hasattr(env.env.cfg, 'action_chunk_size') else env.env.cfg.action_chunk_size
 
     @property
     def state_space(self) -> gymnasium.Space | None:
@@ -60,14 +61,30 @@ class IsaacLabWrapper(Wrapper):
 
         :return: Observation, reward, terminated, truncated, info.
         """
-        actions = unflatten_tensorized_space(self.action_space, actions)
-        with torch.no_grad():
-            observations, reward, terminated, truncated, self._info = self._env.step(actions)
+        # OG
+        # actions = unflatten_tensorized_space(self.action_space, actions)
+        # with torch.no_grad():
+        #     observations, reward, terminated, truncated, self._info = self._env.step(actions)
+        # self._observations = flatten_tensorized_space(tensorize_space(self.observation_space, observations["policy"]))
+        # states = observations.get("critic", None)
+        # if states is not None:
+        #     self._states = flatten_tensorized_space(tensorize_space(self.state_space, states))
+        # return self._observations, reward.view(-1, 1), terminated.view(-1, 1), truncated.view(-1, 1), self._info
+
+        # For action chunking
+        if self._action_chunk_size == 1:
+            actions = unflatten_tensorized_space(self.action_space, actions)
+        reward = torch.zeros((actions.shape[0], self._action_chunk_size), device=self.device)
+        terminated = torch.zeros((actions.shape[0], self._action_chunk_size), device=self.device)
+        truncated = torch.zeros((actions.shape[0], self._action_chunk_size), device=self.device)
+        for i, cur_act in enumerate(actions.chunk(self._action_chunk_size, dim=-1)):
+            with torch.no_grad():
+                observations, reward[:, i], terminated[:, i], truncated[:, i], self._info = self._env.step(cur_act)
         self._observations = flatten_tensorized_space(tensorize_space(self.observation_space, observations["policy"]))
         states = observations.get("critic", None)
         if states is not None:
             self._states = flatten_tensorized_space(tensorize_space(self.state_space, states))
-        return self._observations, reward.view(-1, 1), terminated.view(-1, 1), truncated.view(-1, 1), self._info
+        return self._observations, reward.view(-1, self._action_chunk_size), terminated.any(dim=-1, keepdim=True).view(-1, 1), truncated.any(dim=-1, keepdim=True).view(-1, 1), self._info
 
     def state(self) -> torch.Tensor | None:
         """Get the environment state.
