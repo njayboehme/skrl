@@ -59,23 +59,23 @@ class TransformerGaussian(GaussianMixin, Model):
             reduction=reduction,
             role=role,
         )
-        model_params = network[0]['model_params']
-        self.inp_type = network[0]['input']
-        inp_size = get_num_units(network[0]['input'], self.num_observations, self.num_states, self.num_actions)
+        self.model_params = network[0]
+        # self.inp_type = network[0]['input']
+        inp_size = get_num_units(self.model_params['input'], self.num_observations, self.num_states, self.num_actions)
         out_size = get_num_units(output, self.num_observations, self.num_states, self.num_actions)
-        self.net = TransformerNetwork(inp_size, model_params)
-        self.output_layer = nn.Linear(model_params['d_model'], out_size)
+        self.net = TransformerNetwork(inp_size, self.model_params)
+        self.output_layer = nn.Linear(self.model_params['d_model'], out_size * self.model_params.get('num_pred_acts', 1))
 
         self.log_std_parameter = nn.Parameter(
             torch.full(size=(self.num_actions,), fill_value=float(initial_log_std), dtype=torch.float32), requires_grad=not fixed_log_std
         )
     
     def compute(self, inputs, role=""):
-        if self.inp_type == 'OBSERVATIONS':
+        if self.model_params['input'] == 'OBSERVATIONS':
             inp = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
-        elif self.inp_type == 'STATES':
+        elif self.model_params['input'] == 'STATES':
             inp = unflatten_tensorized_space(self.state_space, inputs.get("states"))
-        elif self.inp_type == 'ACTIONS':
+        elif self.model_params['input'] == 'ACTIONS':
             inp = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
         output = self.net(inp)
         output = self.output_layer(output)

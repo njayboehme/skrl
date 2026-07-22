@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Any, Literal, Union
 from skrl.utils.transformer_utils.torch.decoder import DecoderNetwork
-from skrl.utils.transformer_utils.torch.encoder import EncoderNetwork, AdaptiveEncoderNetwork
+from skrl.utils.transformer_utils.torch.encoder import EncoderNetwork
 from skrl.utils.transformer_utils.torch.embedder import Embedder
 from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoProcessor, AutoImageProcessor
 
@@ -14,18 +14,23 @@ class TransformerNetwork(nn.Module):
         self.proprioception_embeds = Embedder(input_size, model_params)
 
         # Pooling method
-        self.pool_method: Literal['mean', 'max', 'last', 'CLS'] = model_params['pooling_method']
+        self.pool_method: Literal['mean', 'max', 'last', 'CLS'] = model_params.get('pooling_method', None)
         if self.pool_method == 'CLS':
             self.cls_token = nn.Parameter(
                 torch.zeros(size=(1, model_params['d_model'],), dtype=torch.float32), requires_grad=True
             )
-
-        # Project pooled token into action space
-        # self.output_layer = nn.Linear(model_params['d_model'], output_size)
+        
+        # Number of action steps to predict
+        self.num_pred_acts = model_params.get('num_pred_acts', 1)
+        self.action_pred_type = model_params.get('action_pred_type', None)
+        if self.action_pred_type == 'action_tokens':
+            self.action_tokens = nn.Parameter(
+                torch.full(size=(self.num_pred_acts, model_params['d_model']), fill_value=float(0.0), dtype=torch.float32), requires_grad=True
+            )
 
         # Frozen Network
         self.preprocessor = None
-        if model_params['model_path'] is not None:
+        if model_params.get('model_path', None) is not None:
             self.config = AutoConfig.from_pretrained(model_params['model_path'])
             if model_params['use_text'] and model_params['use_images']:
                 self.preprocessor = AutoProcessor.from_pretrained(model_params['model_path'])
@@ -36,35 +41,35 @@ class TransformerNetwork(nn.Module):
             self.pretrained_network = AutoModel.from_config(self.config)
         
         # Trainable Network
-        use_adaptive_encoder = model_params['use_adaptive']
-        zero_out = model_params['zero_out']
+        zero_out = model_params.get('zero_out', False)
         # Encoder
-        if model_params['use_encoder']:
-            if not use_adaptive_encoder:
-                self.enc = EncoderNetwork(model_params)
-            else:
-                self.enc = AdaptiveEncoderNetwork(model_params)
-                if zero_out:
-                    for l in self.enc.encoder.layers:
-                        nn.init.constant_(l.adaln[-1].weight, 0)
-                        nn.init.constant_(l.adaln[-1].bias, 0)
-                    # nn.init.constant_(self.output_layer.linear.weight, 0)
-                    # nn.init.constant_(self.output_layer.linear.bias, 0)
+        if model_params.get('use_encoder', False):
+            self.enc = EncoderNetwork(model_params)
+            if zero_out:
+                for l in self.enc.encoder.layers:
+                    nn.init.constant_(l.adaln[-1].weight, 0)
+                    nn.init.constant_(l.adaln[-1].bias, 0)
+                # nn.init.constant_(self.output_layer.linear.weight, 0)
+                # nn.init.constant_(self.output_layer.linear.bias, 0)
         # Decoder
-        if model_params['use_decoder']:
+        if model_params.get('use_decoder', False):
             self.dec = DecoderNetwork(model_params)
 
     
     def pool(self, x):
         # x is B x S x d_model
-        # Returns x as B x d_model
-        if self.pool_method == 'mean':
+        # Returns x as B x num_pred_acts 3 d_model
+        if self.action_pred_type == 'action_tokens':
+            return x[:, -self.num_pred_acts, :]
+        # Everything below returns x as B x d_model
+        elif self.pool_method == 'mean':
             return torch.mean(x, dim=1)
         elif self.pool_method == 'max':
             return torch.max(x, dim=1)[0]
         elif self.pool_method in ['last', 'CLS']:
             # This assumes the CLS token is the last token
             return x[:, -1, :]
+        # For unspecified pool methods, just return x
         return x
 
     def split_input(self, x):
@@ -78,6 +83,8 @@ class TransformerNetwork(nn.Module):
         prop_embeds = self.proprioception_embeds(prop)
         if self.pool_method == 'CLS':
             prop_embeds = torch.cat((prop_embeds, self.cls_token.unsqueeze(0).expand(prop_embeds.shape[0], -1, -1)), dim=1)
+        if self.action_pred_type == 'action_tokens':
+            prop_embeds = torch.cat((prop_embeds, self.action_tokens), dim=1)
         pretrained_inputs = None
         if self.preprocessor is not None:
             # Process text and img
@@ -107,5 +114,4 @@ class TransformerNetwork(nn.Module):
             x = self.dec(x)
         
         x = self.pool(x)
-        # return self.output_layer(x)
         return x

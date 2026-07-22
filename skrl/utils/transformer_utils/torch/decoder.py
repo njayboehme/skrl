@@ -8,8 +8,8 @@ class DecoderNetwork(nn.Module):
         decoder_layer = nn.TransformerDecoderLayer(d_model=model_params['d_model'], 
                                                    nhead=model_params['nhead'],
                                                    dim_feedforward=model_params['dim_feedforward'],
-                                                   batch_first=model_params['batch_first'],
-                                                   norm_first=model_params['norm_first'])
+                                                   batch_first=model_params.get('batch_first', True),
+                                                   norm_first=model_params.get('norm_first', True))
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=model_params['num_layers'], )
     
     def forward(self, x):

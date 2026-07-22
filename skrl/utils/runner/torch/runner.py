@@ -149,8 +149,17 @@ class Runner:
         from skrl.utils.transformer_model_instantiators.torch.transformer_deterministic import TransformerDeterministic
         from skrl.utils.transformer_model_instantiators.torch.transformer_gaussian import TransformerGaussian
         from skrl.utils.transformer_model_instantiators.torch.transformer_shared import TransformerShared
+
+        # Import LSTM policies
+        from skrl.utils.other_model_instantiators.torch.lstm_deterministic import LSTMDeterministic
+        from skrl.utils.other_model_instantiators.torch.lstm_gaussian import LSTMGaussian
+        from skrl.utils.other_model_instantiators.torch.lstm_shared import LSTMShared
+
+        # Import MLP policies
+        from skrl.utils.other_model_instantiators.torch.mlp_shared_chunked import MLPShared
         
         # Import Algorithms
+        from skrl.agents.torch.ppo import PPO_RNN, PPO_RNN_CFG, PPO_CHUNKED, PPO_CHUNKED_CFG
 
         component = {
             # models
@@ -163,6 +172,10 @@ class Runner:
             "transformergaussian": TransformerGaussian,
             "transformerdeterministic": TransformerDeterministic,
             "transformershared": TransformerShared,
+            "lstmgaussian": LSTMGaussian,
+            "lstmdeterministic": LSTMDeterministic,
+            "lstmshared": LSTMShared,
+            "mlpshared": MLPShared,
             # memories
             "randommemory": RandomMemory,
             # agents
@@ -180,6 +193,10 @@ class Runner:
             "dqn_cfg": DQN_CFG,
             "ppo": PPO,
             "ppo_cfg": PPO_CFG,
+            "ppo_rnn": PPO_RNN,
+            "ppo_rnn_cfg": PPO_RNN_CFG,
+            "ppo_chunked": PPO_CHUNKED,
+            "ppo_chunked_cfg": PPO_CHUNKED_CFG,
             "rpo": RPO,
             "rpo_cfg": RPO_CFG,
             "sac": SAC,
@@ -350,6 +367,11 @@ class Runner:
                     parameters.append(self._process_cfg(models_cfg[role]))
                 if str.startswith(structure[0].lower(), 'transformer'):
                     model_class = 'TransformerShared'
+                elif str.startswith(structure[0].lower(), 'lstm'):
+                    model_class = 'LSTMShared'
+                    parameters.append(env.num_envs)
+                elif str.startswith(structure[0].lower(), 'mlp'):
+                    model_class = 'MLPShared'
                 else:
                     model_class = 'Shared'
                 model_class = self._component(model_class)
@@ -476,7 +498,7 @@ class Runner:
                 "reply_buffer": reply_buffer,
                 "collect_reference_motions": lambda num_samples: env.collect_reference_motions(num_samples),
             }
-        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo"]:
+        elif agent_class in ["a2c", "cem", "ddpg", "ddqn", "dqn", "ppo", "rpo", "sac", "td3", "trpo", "ppo_rnn", "ppo_chunked"]:
             agent_id = possible_agents[0]
             agent_cfg = dataclasses.asdict(self._component(f"{agent_class}_CFG")(**self._process_cfg(cfg["agent"])))
             agent_cfg.get("observation_preprocessor_kwargs", {}).update(

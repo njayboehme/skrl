@@ -6,31 +6,21 @@ import textwrap
 import gymnasium
 
 import torch
-import torch.nn as nn  # noqa
+import torch.nn as nn
 
-from skrl.models.torch import Model  # noqa
-from skrl.models.torch import (  # noqa
-    DeterministicMixin,
-    GaussianMixin,
-)
-from skrl.utils.model_instantiators.torch.common import one_hot_encoding  # noqa
-from skrl.utils.model_instantiators.torch.common import generate_containers
-from skrl.utils.spaces.torch import unflatten_tensorized_space  # noqa
-from skrl.utils.transformer_utils.torch import TransformerNetwork
-from skrl.utils.transformer_utils.torch.utils import get_num_units
+from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
+from skrl.utils.spaces.torch import unflatten_tensorized_space
 
-
-class TransformerShared(GaussianMixin,DeterministicMixin, Model):
-    def __init__(self,*,
-                 observation_space: gymnasium.Space | None = None,
-                 state_space: gymnasium.Space | None = None,
-                 action_space: gymnasium.Space | None = None,
-                 device: str | torch.device | None = None,
-                 structure: list[str] = ["TransformerGaussian", "TransformerDeterministic"],
-                 roles: list[str] = [],
-                 parameters: list[dict[str, Any]] = [],
-                 single_forward_pass: bool = True,
-                 return_source: bool = False,):
+class MLPShared(GaussianMixin,DeterministicMixin, Model):
+    def __init__(self, observation_space: gymnasium.Space | None = None,
+                state_space: gymnasium.Space | None = None,
+                action_space: gymnasium.Space | None = None,
+                device: str | torch.device | None = None,
+                structure: list[str] = ["MLPGaussianMixin", "DeterministicMixin"],
+                roles: list[str] = [],
+                parameters: list[dict[str, Any]] = [],
+                single_forward_pass: bool = True,
+                return_source: bool = False,):
         Model.__init__(
             self,
             observation_space=observation_space,
@@ -38,7 +28,7 @@ class TransformerShared(GaussianMixin,DeterministicMixin, Model):
             action_space=action_space,
             device=device,
         )
-        if structure[0] == 'TransformerGaussian':
+        if structure[0] == 'MLPGaussianMixin':
             params_0 = parameters[0]
             GaussianMixin.__init__(
                 self,
@@ -46,24 +36,28 @@ class TransformerShared(GaussianMixin,DeterministicMixin, Model):
                 clip_mean_actions=params_0.get('clip_mean_actions', False),
                 clip_log_std=params_0.get('clip_log_std', True),
                 min_log_std=params_0.get('min_log_std', -20.0),
-                max_log_std=params_0.get('max_log_std', 2.0),
-                reduction=params_0.get('reduction', 'sum'),
+                max_log_std=params_0.get('max_log_std', 0.0),
+                reduction="sum",
                 role="policy",
             )
-        if structure[1] == 'TransformerDeterministic':
+        if structure[1] == 'DeterministicMixin':
             params_1 = parameters[1]
             DeterministicMixin.__init__(self, clip_actions=params_1.get('clip_actions', False), role="value")
-
+        net = params_0.get('network', {})[0]
+        act = net.get('activations', 'elu')
+        self.net_container = nn.Sequential()
+        for layer_size in net.get('layers', []):
+            self.net_container.append(nn.LazyLinear(layer_size))
+            if act == 'elu':
+                a = nn.ELU()
+            elif act == 'relu':
+                a = nn.ReLU()
+            self.net_container.append(a)
+        
         self.action_chunk_size = params_0.get('action_chunk_size', 1)
-        model_params = parameters[0]['network'][0]
-        inp_size = get_num_units(model_params['input'], self.num_observations, self.num_states, self.num_actions)
-        self.net_container = TransformerNetwork(inp_size, model_params)
         self.policy_layer = nn.LazyLinear(out_features=self.num_actions * self.action_chunk_size)
-        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions * self.action_chunk_size,), fill_value=0.0, dtype=torch.float32), requires_grad=True)
+        self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions * self.action_chunk_size,), fill_value=params_0.get('initial_log_std', 0.0), dtype=torch.float32), requires_grad=True)
         self.value_layer = nn.LazyLinear(out_features=1)
-
-        if not single_forward_pass:
-            self._shared_output = None
 
     def act(self, inputs, role=""):
         if role == "policy":
@@ -81,9 +75,6 @@ class TransformerShared(GaussianMixin,DeterministicMixin, Model):
             output = self.policy_layer(net)
             return output, {"log_std": self.log_std_parameter}
         elif role == "value":
-            # TODO: When using action tokens, sharing a backbone needs to be done carefully. 
-            #       The actor needs no mask but the critic needs to mask out the action tokens and only use state tokens to predict the value.
-            #       Also, the dimension of _shared_output will be wrong.
             if self._shared_output is None:
                 observations = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
                 states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
