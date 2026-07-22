@@ -371,9 +371,6 @@ class PPO(Agent):
         cumulative_avg_kl = 0
 
         explained_variance = self.explained_variance(self.memory.get_tensor_by_name("values"), self.memory.get_tensor_by_name("returns")).item()
-        rews = self.memory.get_tensor_by_name("rewards")
-        avg_rews = rews.mean()
-        std_rews = rews.std()
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):

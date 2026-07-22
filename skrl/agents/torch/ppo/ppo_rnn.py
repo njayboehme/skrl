@@ -17,7 +17,7 @@ from skrl.models.torch import Model
 from skrl.resources.schedulers.torch import KLAdaptiveLR
 from skrl.utils import ScopedTimer
 
-from .ppo_cfg import PPO_CFG
+from .ppo_rnn_cfg import PPO_RNN_CFG
 
 
 def compute_gae(
@@ -72,7 +72,7 @@ class PPO_RNN(Agent):
         state_space: gymnasium.Space | None = None,
         action_space: gymnasium.Space | None = None,
         device: str | torch.device | None = None,
-        cfg: PPO_CFG | dict = {},
+        cfg: PPO_RNN_CFG | dict = {},
     ) -> None:
         """Proximal Policy Optimization (PPO) with support for Recurrent Neural Networks (RNN, GRU, LSTM, etc.).
 
@@ -88,7 +88,7 @@ class PPO_RNN(Agent):
 
         :raises KeyError: If a configuration key is missing.
         """
-        self.cfg: PPO_CFG
+        self.cfg: PPO_RNN_CFG
         super().__init__(
             models=models,
             memory=memory,
@@ -96,7 +96,7 @@ class PPO_RNN(Agent):
             state_space=state_space,
             action_space=action_space,
             device=device,
-            cfg=PPO_CFG(**cfg) if isinstance(cfg, dict) else cfg,
+            cfg=PPO_RNN_CFG(**cfg) if isinstance(cfg, dict) else cfg,
         )
 
         # models
