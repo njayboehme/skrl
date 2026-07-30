@@ -18,7 +18,7 @@ from skrl.resources.schedulers.torch import KLAdaptiveLR
 from skrl.utils import ScopedTimer
 from skrl.utils.spaces.torch import compute_space_size
 
-from .ppo_cfg import PPO_CFG
+from .ppo_chunked_cfg import PPO_CHUNKED_CFG
 
 
 def compute_gae(
@@ -79,11 +79,9 @@ class PPO_CHUNKED(Agent):
         state_space: gymnasium.Space | None = None,
         action_space: gymnasium.Space | None = None,
         device: str | torch.device | None = None,
-        cfg: PPO_CFG | dict = {},
+        cfg: PPO_CHUNKED_CFG | dict = {},
     ) -> None:
-        """Proximal Policy Optimization (PPO).
-
-        https://arxiv.org/abs/1707.06347
+        """Proximal Policy Optimization (PPO) with action chunking.
 
         :param models: Agent's models.
         :param memory: Memory to storage agent's data and environment transitions.
@@ -95,7 +93,7 @@ class PPO_CHUNKED(Agent):
 
         :raises KeyError: If a configuration key is missing.
         """
-        self.cfg: PPO_CFG
+        self.cfg: PPO_CHUNKED_CFG
         super().__init__(
             models=models,
             memory=memory,
@@ -103,12 +101,17 @@ class PPO_CHUNKED(Agent):
             state_space=state_space,
             action_space=action_space,
             device=device,
-            cfg=PPO_CFG(**cfg) if isinstance(cfg, dict) else cfg,
+            cfg=PPO_CHUNKED_CFG(**cfg) if isinstance(cfg, dict) else cfg,
         )
 
         # models
         self.policy = self.models.get("policy", None)
         self.value = self.models.get("value", None)
+
+        # Action Chunking variables
+        self.use_residual = hasattr(self.policy, 'residual')
+        self.action_size = compute_space_size(self.action_space)
+        self.chunk_size = 1 if not hasattr(self.policy, 'action_chunk_size') else self.policy.action_chunk_size
 
         # checkpoint models
         self.checkpoint_modules["policy"] = self.policy
@@ -180,8 +183,8 @@ class PPO_CHUNKED(Agent):
         if self.memory is not None:
             self.memory.create_tensor(name="observations", size=self.observation_space, dtype=torch.float32)
             self.memory.create_tensor(name="states", size=self.state_space, dtype=torch.float32)
-            self.memory.create_tensor(name="actions", size=compute_space_size(self.action_space) * self.policy.action_chunk_size, dtype=torch.float32)
-            self.memory.create_tensor(name="rewards", size=self.policy.action_chunk_size, dtype=torch.float32)
+            self.memory.create_tensor(name="actions", size=compute_space_size(self.action_space) * self.chunk_size, dtype=torch.float32)
+            self.memory.create_tensor(name="rewards", size=self.chunk_size, dtype=torch.float32)
             self.memory.create_tensor(name="terminated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="log_prob", size=1, dtype=torch.float32)
@@ -197,8 +200,17 @@ class PPO_CHUNKED(Agent):
         self._current_log_prob = None
         self._current_values = None
         self._rollout = 0
+
+        # For storing chunk stuff
+        num_envs = self.memory.tensors['terminated'].shape[1]
+        self._current_action_chunk = None
+        self._chunk_observations = None
+        self._chunk_states = None
+        self._current_rewards = torch.empty(num_envs, self.chunk_size, dtype=torch.float32)
+        self._terminated = torch.empty(num_envs, self.chunk_size, dtype=torch.bool)
+        self._truncated = torch.empty(num_envs, self.chunk_size, dtype=torch.bool)
         # num_rollouts x action_chunk_size x 1
-        self._discount_vector = self.cfg.discount_factor ** torch.arange(self.policy.action_chunk_size, device=self.device).repeat(self.cfg.rollouts, 1).unsqueeze(-1)
+        self._discount_vector = self.cfg.discount_factor ** torch.arange(self.chunk_size, device=self.device).repeat(self.memory.memory_size, 1).unsqueeze(-1)
 
     def act(
         self, observations: torch.Tensor, states: torch.Tensor | None, *, timestep: int, timesteps: int
@@ -224,13 +236,20 @@ class PPO_CHUNKED(Agent):
 
         # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-            actions, outputs = self.policy.act(inputs, role="policy")
-            self._current_log_prob = outputs["log_prob"]
+            if self._rollout % self.chunk_size == 0:
+                actions, outputs = self.policy.act(inputs, role="policy")
+                self._current_log_prob = outputs["log_prob"]
+                self._current_action_chunk = actions
 
-            # compute values
-            if self.training:
-                values, _ = self.value.act(inputs, role="value")
-                self._current_values = self._value_preprocessor(values, inverse=True)
+                # compute values
+                if self.training:
+                    values, _ = self.value.act(inputs, role="value")
+                    self._current_values = self._value_preprocessor(values, inverse=True)
+
+            chunk_ind = self._rollout % self.chunk_size
+            actions = self._current_action_chunk[:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
+            # Generally, when running .act outputs is none...
+            outputs = None
 
         return actions, outputs
 
@@ -298,16 +317,25 @@ class PPO_CHUNKED(Agent):
                 rewards[..., -1:] += (self.cfg.discount_factor**rewards.shape[-1]) * next_values * truncated
 
             # storage transition in memory
-            self.memory.add_samples(
-                observations=observations,
-                states=states,
-                actions=actions,
-                rewards=rewards,
-                terminated=terminated,
-                truncated=truncated,
-                log_prob=self._current_log_prob,
-                values=self._current_values,
-            )
+            chunk_ind = self._rollout % self.chunk_size
+            self._terminated[:, chunk_ind] = terminated.squeeze(-1)
+            self._truncated[:, chunk_ind] = truncated.squeeze(-1)
+            self._current_rewards[:, chunk_ind] = rewards.squeeze(-1)
+            if chunk_ind == 0:
+                self._chunk_observations = observations
+                self._chunk_states = states
+            # If the policy is about to predict again, add to the samples
+            if chunk_ind == self.chunk_size - 1:
+                self.memory.add_samples(
+                    observations=self._chunk_observations,
+                    states=self._chunk_states,
+                    actions=self._current_action_chunk,
+                    rewards=self._current_rewards,
+                    terminated=torch.any(self._terminated, dim=-1, keepdim=True),
+                    truncated=torch.any(self._truncated, dim=-1, keepdim=True),
+                    log_prob=self._current_log_prob,
+                    values=self._current_values,
+                )
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         """Method called before the interaction with the environment.
