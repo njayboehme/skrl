@@ -134,6 +134,12 @@ class PPO_CHUNKED_CFG(AgentCfg):
     mixed_precision: bool = False
     """Whether to enable automatic mixed precision for higher performance."""
 
+    action_chunk_size: int = 1
+    """The number of actions to predict"""
+
+    use_all_states: bool = False
+    """Whether to use all states when training the policy or just the states the chunked policy sees"""
+
     def expand(self) -> None:
         """Expand the configuration."""
         super().expand()

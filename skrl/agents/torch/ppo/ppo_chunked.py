@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from skrl import config, logger
 from skrl.agents.torch import Agent
-from skrl.memories.torch import Memory
+from skrl.memories.torch import Memory, RandomChunkedMemory
 from skrl.models.torch import Model
 from skrl.resources.schedulers.torch import KLAdaptiveLR
 from skrl.utils import ScopedTimer
@@ -31,7 +31,9 @@ def compute_gae(
     discount_factor: float = 0.99,
     lambda_coefficient: float = 0.95,
     time_limit_bootstrap: bool = False,
+    chunk_size: int = 1,
     discount_vector: torch.Tensor = None,
+    calculate_micro_return: bool = False
 ) -> torch.Tensor:
     """Compute the Generalized Advantage Estimator (GAE).
 
@@ -47,26 +49,58 @@ def compute_gae(
     :return: Generalized Advantage Estimator.
     """
     not_done = ((terminated | truncated) if time_limit_bootstrap else terminated).logical_not()
+    # num_envs x (num_rollouts * chunk_size) x 1
+    macro_rewards_trans = rewards.transpose(0, 1)
+    macro_rewards_reshaped = macro_rewards_trans.reshape(macro_rewards_trans.shape[0], -1, chunk_size)
+    macro_rewards_fin = torch.bmm(macro_rewards_reshaped, discount_vector)
+    macro_rewards = macro_rewards_fin.transpose(0, 1)
+    macro_discount_factor = discount_factor**chunk_size
+
+    macro_advantage = 0
+    macro_advantages = torch.zeros_like(macro_rewards)
+    if calculate_micro_return:
+        # reshape rewards to be memory_size * chunk_size x num_envs x 1
+        micro_advantage = 0
+        micro_advantages = torch.zeros_like(rewards)
+    
     memory_size = rewards.shape[0]
-
-    macro_rewards = torch.bmm(rewards, discount_vector)
-    macro_discount_factor = discount_factor**rewards.shape[-1]
-
-    advantage = 0
-    advantages = torch.zeros_like(macro_rewards)
     # advantages computation
     for i in reversed(range(memory_size)):
-        next_values = values[i + 1] if i < memory_size - 1 else last_values
-        advantage = (
-            macro_rewards[i] - values[i] + macro_discount_factor * not_done[i] * (next_values + lambda_coefficient * advantage)
-        )
-        advantages[i] = advantage
-    # returns computation
-    returns = advantages + values
-    # normalize advantages
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        if calculate_micro_return:
+            next_values = values[i + 1] if i < memory_size - 1 else last_values
+            micro_advantage = (
+                rewards[i] - values[i] + discount_factor * not_done[i] * (next_values + lambda_coefficient * micro_advantage)
+            )
+            micro_advantages[i] = micro_advantage
 
-    return returns, advantages
+            if i % chunk_size == 0:
+                next_macro_values = values[i + chunk_size] if i < memory_size - chunk_size else last_values
+                # Multiply across timesteps (dim 0)
+                not_done_chunk = torch.prod(not_done[i:i+chunk_size], dim=0)
+                macro_advantage = (
+                    macro_rewards[i//chunk_size] - values[i] + macro_discount_factor * not_done_chunk * (next_macro_values + lambda_coefficient * macro_advantage)
+                )
+                macro_advantages[i//chunk_size] = macro_advantage
+        else:
+            next_values = values[i + 1] if i < memory_size - 1 else last_values
+            macro_advantage = (
+                macro_rewards[i] - values[i] + macro_discount_factor * not_done[i] * (next_values + lambda_coefficient * macro_advantage)
+            )
+            macro_advantages[i] = macro_advantage
+
+    # returns computation
+    macro_returns = macro_advantages + values if not calculate_micro_return else macro_advantages + values[::chunk_size]
+    # normalize advantages
+    macro_advantages = (macro_advantages - macro_advantages.mean()) / (macro_advantages.std() + 1e-8)
+    
+    if calculate_micro_return:
+        micro_returns = micro_advantages + values
+        micro_advantages = (micro_advantages - micro_advantages.mean()) / (micro_advantages.std() + 1e-8)
+    else:
+        micro_returns = None
+        micro_advantages = None
+
+    return macro_returns, macro_advantages, micro_returns, micro_advantages
 
 
 class PPO_CHUNKED(Agent):
@@ -111,7 +145,8 @@ class PPO_CHUNKED(Agent):
         # Action Chunking variables
         self.use_residual = hasattr(self.policy, 'residual')
         self.action_size = compute_space_size(self.action_space)
-        self.chunk_size = 1 if not hasattr(self.policy, 'action_chunk_size') else self.policy.action_chunk_size
+        self.chunk_size = self.cfg.action_chunk_size
+        self.use_all_states = True if self.use_residual or self.cfg.use_all_states else False
 
         # checkpoint models
         self.checkpoint_modules["policy"] = self.policy
@@ -181,18 +216,36 @@ class PPO_CHUNKED(Agent):
 
         # create tensors in memory
         if self.memory is not None:
-            self.memory.create_tensor(name="observations", size=self.observation_space, dtype=torch.float32)
-            self.memory.create_tensor(name="states", size=self.state_space, dtype=torch.float32)
+            # if isinstance(self.memory, RandomChunkedMemory)
+            scale = 1 if not self.use_all_states else self.chunk_size
+            # Scaled
+            self.memory.create_tensor(name="observations", size=self.observation_space, scale=scale, dtype=torch.float32)
+            self.memory.create_tensor(name="states", size=self.state_space, scale=scale, dtype=torch.float32)
+
             self.memory.create_tensor(name="actions", size=compute_space_size(self.action_space) * self.chunk_size, dtype=torch.float32)
-            self.memory.create_tensor(name="rewards", size=self.chunk_size, dtype=torch.float32)
-            self.memory.create_tensor(name="terminated", size=1, dtype=torch.bool)
-            self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
+            self.memory.create_tensor(name="rewards", size=self.chunk_size if scale == 1 else 1, scale=scale, dtype=torch.float32)
+
+            # Scaled
+            self.memory.create_tensor(name="terminated", size=1, scale=scale, dtype=torch.bool)
+            self.memory.create_tensor(name="truncated", size=1, scale=scale, dtype=torch.bool)
+
             self.memory.create_tensor(name="log_prob", size=1, dtype=torch.float32)
-            self.memory.create_tensor(name="values", size=1, dtype=torch.float32)
-            self.memory.create_tensor(name="returns", size=1, dtype=torch.float32)
+
+            # Scaled
+            self.memory.create_tensor(name="values", size=1, scale=scale, dtype=torch.float32)
+            self.memory.create_tensor(name="returns", size=1, scale=scale, dtype=torch.float32)
+
             self.memory.create_tensor(name="advantages", size=1, dtype=torch.float32)
 
-            self._tensors_names = ["observations", "states", "actions", "log_prob", "values", "returns", "advantages"]
+            micro_sizes = [None, None, None] if not self.use_residual else [self.action_space, 1, 1]
+            # For residual
+            self.memory.create_tensor(name="micro_actions", size=micro_sizes[0], scale=scale, dtype=torch.float32) 
+            self.memory.create_tensor(name="micro_log_prob", size=micro_sizes[1], scale=scale, dtype=torch.float32)
+            self.memory.create_tensor(name="micro_advantages", size=micro_sizes[2], scale=scale, dtype=torch.float32)
+            # For using all states
+            self.memory.create_tensor(name="micro_returns", size=None if not self.use_all_states else 1, scale=scale, dtype=torch.float32)
+
+            self._tensors_names = ["observations", "states", "actions", "log_prob", "values", "returns", "advantages", "micro_actions", "micro_log_prob", "micro_returns", "micro_advantages"]
 
         # create temporary variables needed for storage and computation
         self._current_next_observations = None
@@ -201,16 +254,25 @@ class PPO_CHUNKED(Agent):
         self._current_values = None
         self._rollout = 0
 
+        # Create temporary variables for residual policy
+        self._current_action_micro = None
+        self._current_log_prob_micro = None
+
         # For storing chunk stuff
         num_envs = self.memory.tensors['terminated'].shape[1]
         self._current_action_chunk = None
-        self._chunk_observations = None
-        self._chunk_states = None
-        self._current_rewards = torch.empty(num_envs, self.chunk_size, dtype=torch.float32)
-        self._terminated = torch.empty(num_envs, self.chunk_size, dtype=torch.bool)
-        self._truncated = torch.empty(num_envs, self.chunk_size, dtype=torch.bool)
+        self._executing_action_chunk = None
+        self._stale_action_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
+        if not self.use_all_states:
+            self._chunk_observations = None
+            self._chunk_states = None
+            self._current_rewards = torch.empty(num_envs, self.chunk_size, dtype=torch.float32)
+            self._terminated = torch.empty(num_envs, self.chunk_size, dtype=torch.bool)
+            self._truncated = torch.empty(num_envs, self.chunk_size, dtype=torch.bool)
         # num_rollouts x action_chunk_size x 1
-        self._discount_vector = self.cfg.discount_factor ** torch.arange(self.chunk_size, device=self.device).repeat(self.memory.memory_size, 1).unsqueeze(-1)
+        # self._discount_vector = self.cfg.discount_factor ** torch.arange(self.chunk_size, device=self.device).repeat(self.memory.memory_size, 1).unsqueeze(-1)
+        # num_envs x chunk_size x 1
+        self._discount_vector = self.cfg.discount_factor ** torch.arange(self.chunk_size, device=self.device).repeat(num_envs, 1).unsqueeze(-1)
 
     def act(
         self, observations: torch.Tensor, states: torch.Tensor | None, *, timestep: int, timesteps: int
@@ -236,21 +298,46 @@ class PPO_CHUNKED(Agent):
 
         # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-            if self._rollout % self.chunk_size == 0:
+            chunk_ind = self._rollout % self.chunk_size
+            if chunk_ind == 0:
                 actions, outputs = self.policy.act(inputs, role="policy")
                 self._current_log_prob = outputs["log_prob"]
                 self._current_action_chunk = actions
+                # self._executing_action_chunk = actions.clone()
+                self._stale_action_mask.zero_()
+            # Don't zero out actions
+            # else:
+            #     if self._stale_action_mask.any():
+            #         reset_envs = self._stale_action_mask.nonzero(as_tuple=True)[0]
+            #         with torch.no_grad():
+            #             new_actions, _ = self.policy.act(inputs, role='policy')
 
-                # compute values
-                if self.training:
-                    values, _ = self.value.act(inputs, role="value")
-                    self._current_values = self._value_preprocessor(values, inverse=True)
+            #         start_idx = chunk_ind * self.action_size
+            #         self._executing_action_chunk[reset_envs, start_idx:] = new_actions[reset_envs, start_idx:]
 
-            chunk_ind = self._rollout % self.chunk_size
+            # actions = self._executing_action_chunk[:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
             actions = self._current_action_chunk[:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
+            if self.use_residual:
+                residual_actions, outputs = self.policy.act(
+                    {"observations":torch.cat((inputs['observations'], actions), dim=-1)}, 
+                    role="residual"
+                )
+                self._current_log_prob_micro = outputs['log_prob']
+                self._current_action_micro = residual_actions
+                actions = actions + residual_actions
+
+            # Zero out actions
+            # # If an environment has ended, make sure no actions are taken
+            env_actions = actions.clone()
+            env_actions[self._stale_action_mask] = 0.0
+
+            # compute values
+            if self.training and (self.use_all_states or chunk_ind == 0):
+                values, _ = self.value.act(inputs, role="value")
+                self._current_values = self._value_preprocessor(values, inverse=True)
+
             # Generally, when running .act outputs is none...
             outputs = None
-
         return actions, outputs
 
     def record_transition(
@@ -318,24 +405,46 @@ class PPO_CHUNKED(Agent):
 
             # storage transition in memory
             chunk_ind = self._rollout % self.chunk_size
-            self._terminated[:, chunk_ind] = terminated.squeeze(-1)
-            self._truncated[:, chunk_ind] = truncated.squeeze(-1)
-            self._current_rewards[:, chunk_ind] = rewards.squeeze(-1)
-            if chunk_ind == 0:
-                self._chunk_observations = observations
-                self._chunk_states = states
-            # If the policy is about to predict again, add to the samples
-            if chunk_ind == self.chunk_size - 1:
+            self._stale_action_mask |= (terminated | truncated).squeeze(-1)
+            if self.use_all_states:
+                # If using all states, add in the step by step data (observations, states, rewards, values, terminated, truncated)
+                residuals = {} if not self.use_residual else {'micro_actions':self._current_action_micro, 'micro_log_prob':self._current_log_prob_micro}
                 self.memory.add_samples(
-                    observations=self._chunk_observations,
-                    states=self._chunk_states,
-                    actions=self._current_action_chunk,
-                    rewards=self._current_rewards,
-                    terminated=torch.any(self._terminated, dim=-1, keepdim=True),
-                    truncated=torch.any(self._truncated, dim=-1, keepdim=True),
-                    log_prob=self._current_log_prob,
+                    observations=observations,
+                    states=states,
+                    rewards=rewards,
+                    terminated=terminated,
+                    truncated=truncated,
                     values=self._current_values,
+                    **residuals
                 )
+                # Add in other data when it is the correct time (actions, log_prob)
+                if chunk_ind == 0:
+                    self.memory.add_samples(
+                        inc_memory_index=True,
+                        actions=self._current_action_chunk,
+                        log_prob=self._current_log_prob,
+                    )
+            else:
+                self._terminated[:, chunk_ind] = terminated.squeeze(-1)
+                self._truncated[:, chunk_ind] = truncated.squeeze(-1)
+                self._current_rewards[:, chunk_ind] = rewards.squeeze(-1)
+                if chunk_ind == 0:
+                    self._chunk_observations = observations
+                    self._chunk_states = states
+                # If the policy is about to predict again, add to the samples
+                if chunk_ind == self.chunk_size - 1:
+                    self.memory.add_samples(
+                        inc_memory_index=True,
+                        observations=self._chunk_observations,
+                        states=self._chunk_states,
+                        actions=self._current_action_chunk,
+                        rewards=self._current_rewards,
+                        terminated=torch.any(self._terminated, dim=-1, keepdim=True),
+                        truncated=torch.any(self._truncated, dim=-1, keepdim=True),
+                        log_prob=self._current_log_prob,
+                        values=self._current_values,
+                    )
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         """Method called before the interaction with the environment.
@@ -386,7 +495,7 @@ class PPO_CHUNKED(Agent):
 
         # memory holds stuff as shape [num_rollout_steps, batch, size]
         values = self.memory.get_tensor_by_name("values")
-        returns, advantages = compute_gae(
+        returns, advantages, micro_returns, micro_advantages = compute_gae(
             rewards=self.memory.get_tensor_by_name("rewards"),
             terminated=self.memory.get_tensor_by_name("terminated"),
             truncated=self.memory.get_tensor_by_name("truncated"),
@@ -395,22 +504,27 @@ class PPO_CHUNKED(Agent):
             discount_factor=self.cfg.discount_factor,
             lambda_coefficient=self.cfg.gae_lambda,
             time_limit_bootstrap=self.cfg.time_limit_bootstrap,
-            discount_vector=self._discount_vector
+            chunk_size=self.chunk_size,
+            discount_vector=self._discount_vector,
+            calculate_micro_return=self.use_all_states
         )
 
         self.memory.set_tensor_by_name("values", self._value_preprocessor(values, train=True))
-        self.memory.set_tensor_by_name("returns", self._value_preprocessor(returns, train=True))
+        if not self.use_all_states:
+            self.memory.set_tensor_by_name("returns", self._value_preprocessor(returns, train=True))
+            explained_variance = self.explained_variance(self.memory.get_tensor_by_name("values"), self.memory.get_tensor_by_name("returns")).item()
+        else:
+            self.memory.set_tensor_by_name("micro_returns", self._value_preprocessor(micro_returns, train=True))
+            explained_variance = self.explained_variance(self.memory.get_tensor_by_name("values"), self.memory.get_tensor_by_name("micro_returns")).item()
         self.memory.set_tensor_by_name("advantages", advantages)
+
+        if self.use_residual:
+            self.memory.set_tensor_by_name("micro_advantages", micro_advantages)
 
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
         cumulative_avg_kl = 0
-
-        explained_variance = self.explained_variance(self.memory.get_tensor_by_name("values"), self.memory.get_tensor_by_name("returns")).item()
-        # rews = self.memory.get_tensor_by_name("rewards")
-        # avg_rews = rews.mean()
-        # std_rews = rews.std()
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):
@@ -425,8 +539,12 @@ class PPO_CHUNKED(Agent):
                 sampled_values,
                 sampled_returns,
                 sampled_advantages,
+                sampled_micro_actions,
+                sampled_micro_log_prob,
+                sampled_micro_returns,
+                sampled_micro_advantages,
             ) in self.memory.sample(
-                names=self._tensors_names, batch_size=len(self.memory), mini_batches=self.cfg.mini_batches
+                names=self._tensors_names, batch_size=len(self.memory), mini_batches=self.cfg.mini_batches, chunk_size=1 if not self.use_all_states else self.chunk_size,
             ):
 
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
@@ -434,8 +552,12 @@ class PPO_CHUNKED(Agent):
                         "observations": self._observation_preprocessor(sampled_observations, train=not epoch),
                         "states": self._state_preprocessor(sampled_states, train=not epoch),
                     }
-
-                    _, outputs = self.policy.act({**inputs, "taken_actions": sampled_actions}, role="policy")
+                    if not self.use_all_states:
+                        _, outputs = self.policy.act({**inputs, "taken_actions": sampled_actions}, role="policy")
+                    else:
+                        _, outputs = self.policy.act({'observations':inputs['observations'][::self.chunk_size], "taken_actions": sampled_actions}, role="policy")
+                        if hasattr(self.policy, '_shared_output'):
+                            self.policy._shared_output = None
                     next_log_prob = outputs["log_prob"]
 
                     # compute approximate KL divergence
@@ -470,7 +592,7 @@ class PPO_CHUNKED(Agent):
                         predicted_values = sampled_values + torch.clip(
                             predicted_values - sampled_values, min=-self.cfg.value_clip, max=self.cfg.value_clip
                         )
-                    value_loss = self.cfg.value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
+                    value_loss = self.cfg.value_loss_scale * F.mse_loss(sampled_returns if not self.use_all_states else sampled_micro_returns, predicted_values)
 
                 # optimization step
                 self.optimizer.zero_grad()
