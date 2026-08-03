@@ -134,6 +134,7 @@ class Runner:
         from skrl.agents.torch.td3 import TD3, TD3_CFG
         from skrl.agents.torch.trpo import TRPO, TRPO_CFG
         from skrl.memories.torch import RandomMemory
+        from skrl.memories.torch import RandomChunkedMemory
         from skrl.multi_agents.torch.ippo import IPPO, IPPO_CFG
         from skrl.multi_agents.torch.mappo import MAPPO, MAPPO_CFG
         from skrl.trainers.torch import SequentialTrainer, SequentialTrainerCfg
@@ -157,6 +158,7 @@ class Runner:
 
         # Import MLP policies
         from skrl.utils.other_model_instantiators.torch.mlp_shared_chunked import MLPShared
+        from skrl.utils.other_model_instantiators.torch.mlp_gaussian_chunked import MLPGaussian
         
         # Import Algorithms
         from skrl.agents.torch.ppo import PPO_RNN, PPO_RNN_CFG, PPO_CHUNKED, PPO_CHUNKED_CFG
@@ -175,9 +177,11 @@ class Runner:
             "lstmgaussian": LSTMGaussian,
             "lstmdeterministic": LSTMDeterministic,
             "lstmshared": LSTMShared,
+            "mlpgaussian": MLPGaussian,
             "mlpshared": MLPShared,
             # memories
             "randommemory": RandomMemory,
+            "randomchunkedmemory": RandomChunkedMemory,     
             # agents
             "a2c": A2C,
             "a2c_cfg": A2C_CFG,
