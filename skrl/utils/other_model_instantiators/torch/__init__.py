@@ -2,3 +2,4 @@ from skrl.utils.other_model_instantiators.torch.lstm_deterministic import LSTMDe
 from skrl.utils.other_model_instantiators.torch.lstm_gaussian import LSTMGaussian
 from skrl.utils.other_model_instantiators.torch.lstm_shared import LSTMShared
 from skrl.utils.other_model_instantiators.torch.mlp_shared_chunked import MLPShared
+from skrl.utils.other_model_instantiators.torch.mlp_gaussian_chunked import MLPGaussian
