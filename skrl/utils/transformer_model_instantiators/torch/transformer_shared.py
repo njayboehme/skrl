@@ -54,16 +54,17 @@ class TransformerShared(GaussianMixin,DeterministicMixin, Model):
             params_1 = parameters[1]
             DeterministicMixin.__init__(self, clip_actions=params_1.get('clip_actions', False), role="value")
 
-        self.action_chunk_size = params_0.get('action_chunk_size', 1)
         model_params = parameters[0]['network'][0]
+        model_params['action_chunk_size'] = params_0.get('action_chunk_size', 1)
+        model_params['action_pred_type'] = params_0.get('action_pred_type', None)
+        self.action_chunk_size = model_params.get('action_chunk_size', 1)
+        self.action_pred_type = model_params.get('action_pred_type', None)
+        out_chunk = self.action_chunk_size if not self.action_pred_type else 1
         inp_size = get_num_units(model_params['input'], self.num_observations, self.num_states, self.num_actions)
-        self.net_container = TransformerNetwork(inp_size, model_params)
-        self.policy_layer = nn.LazyLinear(out_features=self.num_actions * self.action_chunk_size)
+        self.net_container = TransformerNetwork(inp_size, model_params, shared=True)
+        self.policy_layer = nn.LazyLinear(out_features=self.num_actions * out_chunk)
         self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions * self.action_chunk_size,), fill_value=0.0, dtype=torch.float32), requires_grad=True)
         self.value_layer = nn.LazyLinear(out_features=1)
-
-        if not single_forward_pass:
-            self._shared_output = None
 
     def act(self, inputs, role=""):
         if role == "policy":
@@ -77,21 +78,20 @@ class TransformerShared(GaussianMixin,DeterministicMixin, Model):
             states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
             taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
             net = self.net_container(observations)
-            self._shared_output = net
             output = self.policy_layer(net)
+            # If there is a different method than just a larger policy layer
+            if self.action_pred_type:
+                output = output.flatten(start_dim=1, end_dim=-1)
             return output, {"log_std": self.log_std_parameter}
         elif role == "value":
-            # TODO: When using action tokens, sharing a backbone needs to be done carefully. 
-            #       The actor needs no mask but the critic needs to mask out the action tokens and only use state tokens to predict the value.
-            #       Also, the dimension of _shared_output will be wrong.
-            if self._shared_output is None:
+            state_token = self.net_container.get_state_token()
+            if state_token is None:
                 observations = unflatten_tensorized_space(self.observation_space, inputs.get("observations"))
                 states = unflatten_tensorized_space(self.state_space, inputs.get("states"))
                 taken_actions = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
                 net = self.net_container(observations)
                 shared_output = net
             else:
-                shared_output = self._shared_output
-            self._shared_output = None
+                shared_output = state_token
             output = self.value_layer(shared_output)
             return output, {}

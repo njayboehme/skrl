@@ -40,7 +40,6 @@ class TransformerDeterministic(DeterministicMixin, Model):
                 #  groups: Union[list[int], None] = None
                  ):
         '''
-        tokenization_method: 'all' puts the entire state into a single token, 'single' puts each input into a token, 'bin' uses predefined bins to create tokens for each input, 'groups' groups parts of the input together into a single token
         '''
         
         Model.__init__(
@@ -57,14 +56,10 @@ class TransformerDeterministic(DeterministicMixin, Model):
         )
 
         self.model_params = network[0]
-        # self.inp_type = network[0]['input']
         inp_size = get_num_units(self.model_params['input'], self.num_observations, self.num_states, self.num_actions)
         out_size = get_num_units(output, self.num_observations, self.num_states, self.num_actions)
         self.net = TransformerNetwork(inp_size, self.model_params)
         self.output_layer = nn.Linear(self.model_params['d_model'], out_size)
-        # self.log_std_parameter = nn.Parameter(
-        #     torch.full(size=(self.num_actions,), fill_value=float(initial_log_std), dtype=torch.float32), requires_grad=not fixed_log_std
-        # )
     
     def compute(self, inputs, role=""):
         if self.model_params['input'] == 'OBSERVATIONS':
@@ -75,4 +70,4 @@ class TransformerDeterministic(DeterministicMixin, Model):
             inp = unflatten_tensorized_space(self.action_space, inputs.get("taken_actions"))
         output = self.net(inp)
         output = self.output_layer(output)
-        return output, {{}} #{"log_std": self.log_std_parameter}
+        return output, {} 

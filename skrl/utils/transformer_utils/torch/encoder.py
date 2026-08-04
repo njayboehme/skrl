@@ -84,20 +84,20 @@ class EncoderNetwork(nn.Module):
                                          dropout=model_params.get('dropout', 0.0))
             self.encoder = Encoder(encoder_layer, num_layers=model_params['num_layers'], )
 
-    def forward(self, x):
-        return self.encoder(x)
+    def forward(self, x, mask):
+        return self.encoder(x, mask)
 
 class Encoder(nn.Module):
     def __init__(self, encoder_layer, num_layers, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
 
-    def forward(self, x):
+    def forward(self, x, mask):
         output = x
         for mod in self.layers:
             output = mod(
                 output,
-                attn_mask=None,
+                attn_mask=mask,
                 src_key_padding_mask=None,
                 is_causal=False,
             )
