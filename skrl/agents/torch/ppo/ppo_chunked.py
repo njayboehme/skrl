@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import copy
 import itertools
 import gymnasium
 from packaging import version
@@ -253,6 +254,7 @@ class PPO_CHUNKED(Agent):
         self._current_log_prob = None
         self._current_values = None
         self._rollout = 0
+        self._outputs = None
 
         # Create temporary variables for residual policy
         self._current_action_micro = None
@@ -300,8 +302,8 @@ class PPO_CHUNKED(Agent):
         with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
             chunk_ind = self._rollout % self.chunk_size
             if chunk_ind == 0:
-                actions, outputs = self.policy.act(inputs, role="policy")
-                self._current_log_prob = outputs["log_prob"]
+                actions, self._outputs = self.policy.act(inputs, role="policy")
+                self._current_log_prob = self._outputs["log_prob"]
                 self._current_action_chunk = actions
                 # self._executing_action_chunk = actions.clone()
                 self._stale_action_mask.zero_()
@@ -336,8 +338,13 @@ class PPO_CHUNKED(Agent):
                 values, _ = self.value.act(inputs, role="value")
                 self._current_values = self._value_preprocessor(values, inverse=True)
 
-            # Generally, when running .act outputs is none...
-            outputs = None
+            # When training, outputs isn't used during rollouts
+            if self.training:
+                outputs = None
+            else:
+                outputs = copy.deepcopy(self._outputs)
+                outputs['mean_actions'] = self._outputs['mean_actions'][:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
+                self._rollout += 1
         return actions, outputs
 
     def record_transition(
