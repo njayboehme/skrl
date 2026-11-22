@@ -145,6 +145,7 @@ class PPO_CHUNKED(Agent):
 
         # Action Chunking variables
         self.use_residual = hasattr(self.policy, 'residual')
+        self.residual_training_step = self.cfg.residual_begin_training
         self.action_size = compute_space_size(self.action_space)
         self.chunk_size = self.cfg.action_chunk_size
         self.use_all_states = True if self.use_residual or self.cfg.use_all_states else False
@@ -319,12 +320,12 @@ class PPO_CHUNKED(Agent):
 
             # actions = self._executing_action_chunk[:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
             actions = self._current_action_chunk[:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
-            if self.use_residual:
-                residual_actions, outputs = self.policy.act(
+            if self.use_residual and (timestep >= self.residual_training_step or not self.training):
+                residual_actions, residual_outputs = self.policy.act(
                     {"observations":torch.cat((inputs['observations'], actions), dim=-1)}, 
                     role="residual"
                 )
-                self._current_log_prob_micro = outputs['log_prob']
+                self._current_log_prob_micro = residual_outputs['log_prob']
                 self._current_action_micro = residual_actions
                 actions = actions + residual_actions
 
@@ -344,6 +345,9 @@ class PPO_CHUNKED(Agent):
             else:
                 outputs = copy.deepcopy(self._outputs)
                 outputs['mean_actions'] = self._outputs['mean_actions'][:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
+                if self.use_residual:
+                    outputs['mean_actions'] += residual_outputs['mean_actions']
+                    outputs['mean_actions'] = residual_outputs['mean_actions']
                 self._rollout += 1
         return actions, outputs
 
@@ -415,7 +419,7 @@ class PPO_CHUNKED(Agent):
             self._stale_action_mask |= (terminated | truncated).squeeze(-1)
             if self.use_all_states:
                 # If using all states, add in the step by step data (observations, states, rewards, values, terminated, truncated)
-                residuals = {} if not self.use_residual else {'micro_actions':self._current_action_micro, 'micro_log_prob':self._current_log_prob_micro}
+                residuals = {} if not (self.use_residual and timestep >= self.residual_training_step) else {'micro_actions':self._current_action_micro, 'micro_log_prob':self._current_log_prob_micro}
                 self.memory.add_samples(
                     observations=observations,
                     states=states,
@@ -565,7 +569,17 @@ class PPO_CHUNKED(Agent):
                         _, outputs = self.policy.act({'observations':inputs['observations'][::self.chunk_size], "taken_actions": sampled_actions}, role="policy")
                         if hasattr(self.policy, '_shared_output'):
                             self.policy._shared_output = None
-                    next_log_prob = outputs["log_prob"]
+                        if self.use_residual and timestep >= self.residual_training_step:
+                            _, micro_outputs = self.policy.act(
+                                {
+                                    'observations':torch.cat((inputs['observations'], sampled_actions.view(-1, self.action_size)), dim=-1), 
+                                    "taken_actions": sampled_micro_actions
+                                }, 
+                                role="residual"
+                            )
+                    # TODO: Should I take the average log prob across each chunk?
+                    next_log_prob = outputs["log_prob"] #/ self.chunk_size
+                    # sampled_log_prob = sampled_log_prob / self.chunk_size
 
                     # compute approximate KL divergence
                     with torch.no_grad():
@@ -589,8 +603,18 @@ class PPO_CHUNKED(Agent):
                     surrogate_clipped = sampled_advantages * torch.clip(
                         ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
                     )
-
                     policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+
+                    # Compute residual loss (if using)
+                    if self.use_residual and timestep >= self.residual_training_step:
+                        next_log_prob_micro = micro_outputs['log_prob']
+                        micro_ratio = torch.exp(next_log_prob_micro - sampled_micro_log_prob)
+                        micro_surrogate = sampled_micro_advantages * micro_ratio
+                        micro_surrogate_clipped = sampled_micro_advantages * torch.clip(
+                            micro_ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
+                        )
+                        micro_policy_loss = -torch.min(micro_surrogate, micro_surrogate_clipped).mean()
+                        policy_loss += micro_policy_loss
 
                     # compute value loss
                     predicted_values, _ = self.value.act(inputs, role="value")

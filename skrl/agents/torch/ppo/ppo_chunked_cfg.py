@@ -140,6 +140,9 @@ class PPO_CHUNKED_CFG(AgentCfg):
     use_all_states: bool = False
     """Whether to use all states when training the policy or just the states the chunked policy sees"""
 
+    residual_begin_training: int | None = None
+    """When to begin training the residual"""
+
     def expand(self) -> None:
         """Expand the configuration."""
         super().expand()

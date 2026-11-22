@@ -63,7 +63,7 @@ class MLPShared(GaussianMixin,DeterministicMixin, Model):
                     a = nn.ELU()
                 elif act == 'relu':
                     a = nn.ReLU()
-                self.net_container.append(a)
+                self.residual.append(a)
             self.residual.append(nn.LazyLinear(out_features=self.num_actions))
             self.residual_log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions,), fill_value=residual_params.get('initial_log_std', 0.0), dtype=torch.float32), requires_grad=True)
 
