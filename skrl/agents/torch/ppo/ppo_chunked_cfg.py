@@ -141,7 +141,30 @@ class PPO_CHUNKED_CFG(AgentCfg):
     """Whether to use all states when training the policy or just the states the chunked policy sees"""
 
     residual_begin_training: int | None = None
-    """When to begin training the residual"""
+    """Timestep at which the residual policy starts acting (and is trained once a full rollout has been collected with it)"""
+
+    ratio_clip_chunk_scaling: str | None = None
+    """How to scale the PPO ratio clip range with the number of executed actions ``L`` of each chunk.
+
+    The log-probability of a chunk is the sum of the per-action log-probabilities, so the chunk ratio is the
+    product of the per-action ratios. Options:
+
+    * ``None`` / ``"none"``: clip the chunk ratio to ``[1 - ratio_clip, 1 + ratio_clip]``.
+    * ``"linear"``: clip to ``[1 - L * ratio_clip, 1 + L * ratio_clip]``.
+    * ``"exponential"``: clip to ``[(1 - ratio_clip) ** L, (1 + ratio_clip) ** L]`` (each executed action allowed
+      to move by ``ratio_clip``). Always positive, unlike the linear lower bound when ``L * ratio_clip >= 1``.
+    * ``"per_step"``: no chunk ratio. Each executed action has its own ratio ``r_k``, clipped to
+      ``[1 - ratio_clip, 1 + ratio_clip]``, with the chunk's advantage shared by its actions. The surrogate is
+      averaged over all executed actions of the mini-batch (a true per-action trust region).
+
+    ``L`` equals ``action_chunk_size`` for full chunks and is smaller for chunks cut short by an episode end or
+    the end of the rollout.
+
+    The KL divergence used for ``kl_threshold`` early stopping, ``KLAdaptiveLR`` and the ``Learning / Avg KL``
+    metric is the chunk KL for the chunk-ratio modes and the per-action KL for ``"per_step"``. With the chunk
+    KL (which grows ~linearly with the chunk size), the ``KLAdaptiveLR`` ``kl_threshold`` is multiplied by
+    ``action_chunk_size``; with ``"per_step"`` it is used as given.
+    """
 
     def expand(self) -> None:
         """Expand the configuration."""

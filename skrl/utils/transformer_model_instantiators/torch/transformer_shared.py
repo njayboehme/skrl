@@ -66,6 +66,9 @@ class TransformerShared(GaussianMixin,DeterministicMixin, Model):
         self.log_std_parameter = nn.Parameter(torch.full(size=(self.num_actions * self.action_chunk_size,), fill_value=0.0, dtype=torch.float32), requires_grad=True)
         self.value_layer = nn.LazyLinear(out_features=1)
 
+    def reset_shared_cache(self) -> None:
+        self.net_container.state_token = None
+
     def act(self, inputs, role=""):
         if role == "policy":
             return GaussianMixin.act(self, inputs, role=role)
@@ -93,5 +96,7 @@ class TransformerShared(GaussianMixin,DeterministicMixin, Model):
                 shared_output = net
             else:
                 shared_output = state_token
+            # consume the cached token so a later value call on different inputs recomputes the backbone
+            self.net_container.state_token = None
             output = self.value_layer(shared_output)
             return output, {}

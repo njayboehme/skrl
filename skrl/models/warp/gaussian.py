@@ -7,6 +7,7 @@ import math
 import warp as wp
 
 from skrl import config
+from skrl.utils.framework.warp.types import Tensor
 from skrl.utils.spaces.warp import compute_space_limits
 
 
@@ -26,23 +27,23 @@ def _log_prob(
 @wp.kernel
 def _gaussian(
     # inputs
-    loc: wp.array2d(dtype=float),
-    log_std: wp.array1d(dtype=float),
+    loc: wp.array2d[float],
+    log_std: wp.array1d[float],
     min_log_std: float,
     max_log_std: float,
-    min_actions: wp.array1d(dtype=float),
-    max_actions: wp.array1d(dtype=float),
-    min_mean_actions: wp.array1d(dtype=float),
-    max_mean_actions: wp.array1d(dtype=float),
-    taken_actions: wp.array2d(dtype=float),
+    min_actions: wp.array1d[float],
+    max_actions: wp.array1d[float],
+    min_mean_actions: wp.array1d[float],
+    max_mean_actions: wp.array1d[float],
+    taken_actions: wp.array2d[float],
     reduction: int,
     m: float,
     key: int,
     # outputs
-    loc_out: wp.array2d(dtype=float),
-    actions: wp.array2d(dtype=float),
-    log_prob: wp.array2d(dtype=float),
-    scale: wp.array1d(dtype=float),
+    loc_out: wp.array2d[float],
+    actions: wp.array2d[float],
+    log_prob: wp.array2d[float],
+    scale: wp.array1d[float],
 ):
     i, j = wp.tid()
     subkey = wp.rand_init(key + i, j)
@@ -52,43 +53,47 @@ def _gaussian(
         loc_ij = wp.clamp(loc_ij, min_mean_actions[j], max_mean_actions[j])
     loc_out[i, j] = loc_ij
     # clip log standard deviations and compute distribution parameters
-    scale[j] = wp.exp(wp.clamp(log_std[j], min_log_std, max_log_std))
+    # - keep the scale in a local variable: reading back an array written by the same kernel breaks the gradients
+    # - write the scale output from a single thread: otherwise its adjoint is accumulated once per thread (sample)
+    scale_j = wp.exp(wp.clamp(log_std[j], min_log_std, max_log_std))
+    if i == 0:
+        scale[j] = scale_j
     # sample actions
     if min_actions:
-        actions[i, j] = wp.clamp(2.0 * wp.randn(subkey) * scale[j] + loc_ij, min_actions[j], max_actions[j])
+        actions[i, j] = wp.clamp(wp.randn(subkey) * scale_j + loc_ij, min_actions[j], max_actions[j])
     else:
-        actions[i, j] = 2.0 * wp.randn(subkey) * scale[j] + loc_ij
+        actions[i, j] = wp.randn(subkey) * scale_j + loc_ij
     # log of the probability density function
     if taken_actions:
         # mean
         if reduction == 0:
-            wp.atomic_add(log_prob[i], 0, _log_prob(taken_actions[i, j], loc_ij, scale[j]) / m)
+            wp.atomic_add(log_prob[i], 0, _log_prob(taken_actions[i, j], loc_ij, scale_j) / m)
         # sum
         elif reduction == 1:
-            wp.atomic_add(log_prob[i], 0, _log_prob(taken_actions[i, j], loc_ij, scale[j]))
+            wp.atomic_add(log_prob[i], 0, _log_prob(taken_actions[i, j], loc_ij, scale_j))
         # prod
         elif reduction == 2:
             pass  # TODO: implement prod
         # none
         else:
-            log_prob[i, j] = _log_prob(taken_actions[i, j], loc_ij, scale[j])
+            log_prob[i, j] = _log_prob(taken_actions[i, j], loc_ij, scale_j)
     else:
         # mean
         if reduction == 0:
-            wp.atomic_add(log_prob[i], 0, _log_prob(actions[i, j], loc_ij, scale[j]) / m)
+            wp.atomic_add(log_prob[i], 0, _log_prob(actions[i, j], loc_ij, scale_j) / m)
         # sum
         elif reduction == 1:
-            wp.atomic_add(log_prob[i], 0, _log_prob(actions[i, j], loc_ij, scale[j]))
+            wp.atomic_add(log_prob[i], 0, _log_prob(actions[i, j], loc_ij, scale_j))
         # prod
         elif reduction == 2:
             pass  # TODO: implement prod
         # none
         else:
-            log_prob[i, j] = _log_prob(actions[i, j], loc_ij, scale[j])
+            log_prob[i, j] = _log_prob(actions[i, j], loc_ij, scale_j)
 
 
 @wp.kernel
-def _entropy(stddev: wp.array1d(dtype=float), entropy: wp.array1d(dtype=float)):
+def _entropy(stddev: wp.array1d[float], entropy: wp.array1d[float]):
     i = wp.tid()
     wp.atomic_add(entropy, 0, HALF_LOG_2_PI_PLUS + wp.log(stddev[i]))
 
@@ -141,7 +146,7 @@ class GaussianMixin:
 
         self._g_key = config.warp.key
 
-    def act(self, inputs: dict[str, Any], *, role: str = "") -> tuple[wp.array, dict[str, Any]]:
+    def act(self, inputs: dict[str, Any], *, role: str = "") -> tuple[Tensor, dict[str, Any]]:
         """Act stochastically in response to the observations/states of the environment.
 
         :param inputs: Model inputs. The most common keys are:
@@ -166,7 +171,7 @@ class GaussianMixin:
         shape = mean_actions.shape
         mean_actions_clipped = wp.empty(shape=shape, dtype=wp.float32, device=self.device, requires_grad=True)
         actions = wp.empty(shape=shape, dtype=wp.float32, device=self.device, requires_grad=True)
-        if self._g_reduction == "none":
+        if self._g_reduction == 3:  # none
             log_prob = wp.zeros(shape=shape, dtype=wp.float32, device=self.device, requires_grad=True)
         else:
             log_prob = wp.zeros(shape=(shape[0], 1), dtype=wp.float32, device=self.device, requires_grad=True)
@@ -198,7 +203,7 @@ class GaussianMixin:
         outputs["stddev"] = scale
         return actions, outputs
 
-    def get_entropy(self, stddev: wp.array, *, role: str = "") -> wp.array:
+    def get_entropy(self, stddev: Tensor, *, role: str = "") -> Tensor:
         """Compute and return the entropy of the model.
 
         :param stddev: Model standard deviation.

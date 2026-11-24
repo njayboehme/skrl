@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import copy
 import itertools
 import gymnasium
 from packaging import version
@@ -22,6 +21,37 @@ from skrl.utils.spaces.torch import compute_space_size
 from .ppo_chunked_cfg import PPO_CHUNKED_CFG
 
 
+# Storage layout
+# --------------
+# Everything is stored per environment step: tensors have shape (rollouts, num_envs, size).
+# Each env executes its own chunk of ``C`` actions. A new chunk is predicted for an env when
+#   - its current chunk is exhausted (C actions executed),
+#   - its episode ended at the previous step (terminated or truncated), so the remainder of the old chunk is
+#     discarded and the new episode starts with a fresh chunk,
+#   - a new rollout starts (so no chunk spans two rollouts / updates).
+# The step at which a chunk is predicted is flagged in ``chunk_starts`` and holds the whole chunk (``actions``,
+# shape C * A) and the per-step log-probabilities of the chunk (``log_prob``, shape C). The number of actions of
+# the chunk actually executed (``L <= C``) is recovered from ``chunk_starts`` at update time.
+
+
+def compute_chunk_lengths(chunk_starts: torch.Tensor) -> torch.Tensor:
+    """Number of executed steps of the chunk starting at each step (0 where no chunk starts).
+
+    A chunk runs until (excluded) the next chunk start of the same env, or until the end of the rollout.
+
+    :param chunk_starts: Chunk start flags, shape ``(T, N, 1)``.
+
+    :return: Chunk lengths, shape ``(T, N, 1)``, dtype long.
+    """
+    T = chunk_starts.shape[0]
+    lengths = torch.zeros(chunk_starts.shape, dtype=torch.long, device=chunk_starts.device)
+    next_start = torch.full(chunk_starts.shape[1:], T, dtype=torch.long, device=chunk_starts.device)
+    for t in reversed(range(T)):
+        lengths[t] = torch.where(chunk_starts[t], next_start - t, 0)
+        next_start = torch.where(chunk_starts[t], t, next_start)
+    return lengths
+
+
 def compute_gae(
     *,
     rewards: torch.Tensor,
@@ -29,78 +59,62 @@ def compute_gae(
     truncated: torch.Tensor,
     values: torch.Tensor,
     last_values: torch.Tensor,
+    chunk_starts: torch.Tensor,
     discount_factor: float = 0.99,
     lambda_coefficient: float = 0.95,
     time_limit_bootstrap: bool = False,
-    chunk_size: int = 1,
-    discount_vector: torch.Tensor = None,
-    calculate_micro_return: bool = False
-) -> torch.Tensor:
-    """Compute the Generalized Advantage Estimator (GAE).
+    compute_micro: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Compute chunk-level (macro) and step-level (micro) Generalized Advantage Estimates.
 
-    :param rewards: Rewards obtained by the agent.
-    :param terminated: Signals to indicate that episodes have ended.
-    :param truncated: Signals to indicate that episodes have been truncated.
-    :param values: Values obtained by the agent.
-    :param last_values: Last values obtained by the agent.
-    :param discount_factor: Discount factor.
-    :param lambda_coefficient: Lambda coefficient.
-    :param time_limit_bootstrap: Whether to use time-limit (truncation) bootstrapping.
+    Macro (semi-MDP) advantage of a chunk started at ``t`` and executed for ``L`` steps::
 
-    :return: Generalized Advantage Estimator.
+        R_t   = sum_{k<L} gamma^k r_{t+k}
+        A_t   = R_t + gamma^L * not_done_{t+L-1} * (V(s_{t+L}) + lambda * A_{t+L}) - V(s_t)
+
+    where ``A_{t+L}`` is the advantage of the env's next chunk (0 at the end of the rollout, in which case
+    ``V(s_{t+L})`` is ``last_values``). Since an episode end always starts a new chunk, ``R_t`` never contains
+    rewards from the following episode. ``L == C`` and aligned chunks reproduce the fixed-grid formulation.
+
+    All inputs have shape ``(T, N, 1)`` except ``last_values`` ``(N, 1)``.
+
+    :return: macro returns, macro advantages (0 where no chunk starts), micro returns, micro advantages.
+        Advantages are NOT normalized.
     """
-    not_done = ((terminated | truncated) if time_limit_bootstrap else terminated).logical_not()
-    # num_envs x (num_rollouts * chunk_size) x 1
-    macro_rewards_trans = rewards.transpose(0, 1)
-    macro_rewards_reshaped = macro_rewards_trans.reshape(macro_rewards_trans.shape[0], -1, chunk_size)
-    macro_rewards_fin = torch.bmm(macro_rewards_reshaped, discount_vector)
-    macro_rewards = macro_rewards_fin.transpose(0, 1)
-    macro_discount_factor = discount_factor**chunk_size
+    not_done = ((terminated | truncated) if time_limit_bootstrap else terminated).logical_not().to(values.dtype)
+    chunk_starts = chunk_starts.bool()
+    T = rewards.shape[0]
 
-    macro_advantage = 0
-    macro_advantages = torch.zeros_like(macro_rewards)
-    if calculate_micro_return:
-        # reshape rewards to be memory_size * chunk_size x num_envs x 1
-        micro_advantage = 0
-        micro_advantages = torch.zeros_like(rewards)
-    
-    memory_size = rewards.shape[0]
-    # advantages computation
-    for i in reversed(range(memory_size)):
-        if calculate_micro_return:
-            next_values = values[i + 1] if i < memory_size - 1 else last_values
+    # a chunk segment ends at step t if the env starts a new chunk at t + 1 or if t is the last rollout step
+    segment_end = torch.ones_like(chunk_starts)
+    segment_end[:-1] = chunk_starts[1:]
+
+    macro_advantages = torch.zeros_like(values)
+    micro_advantages = torch.zeros_like(values) if compute_micro else None
+    segment_return = torch.zeros_like(last_values)  # discounted (bootstrapped) reward-to-go of the current chunk
+    next_macro_advantage = torch.zeros_like(last_values)  # macro advantage of the chunk starting at t + 1
+    micro_advantage = torch.zeros_like(last_values)
+
+    for t in reversed(range(T)):
+        next_values = values[t + 1] if t < T - 1 else last_values
+        # macro
+        tail = torch.where(
+            segment_end[t], next_values + lambda_coefficient * next_macro_advantage, segment_return
+        )
+        segment_return = rewards[t] + discount_factor * not_done[t] * tail
+        macro_advantages[t] = torch.where(chunk_starts[t], segment_return - values[t], 0.0)
+        next_macro_advantage = torch.where(chunk_starts[t], macro_advantages[t], next_macro_advantage)
+        # micro
+        if compute_micro:
             micro_advantage = (
-                rewards[i] - values[i] + discount_factor * not_done[i] * (next_values + lambda_coefficient * micro_advantage)
+                rewards[t]
+                - values[t]
+                + discount_factor * not_done[t] * (next_values + lambda_coefficient * micro_advantage)
             )
-            micro_advantages[i] = micro_advantage
+            micro_advantages[t] = micro_advantage
 
-            if i % chunk_size == 0:
-                next_macro_values = values[i + chunk_size] if i < memory_size - chunk_size else last_values
-                # Multiply across timesteps (dim 0)
-                not_done_chunk = torch.prod(not_done[i:i+chunk_size], dim=0)
-                macro_advantage = (
-                    macro_rewards[i//chunk_size] - values[i] + macro_discount_factor * not_done_chunk * (next_macro_values + lambda_coefficient * macro_advantage)
-                )
-                macro_advantages[i//chunk_size] = macro_advantage
-        else:
-            next_values = values[i + 1] if i < memory_size - 1 else last_values
-            macro_advantage = (
-                macro_rewards[i] - values[i] + macro_discount_factor * not_done[i] * (next_values + lambda_coefficient * macro_advantage)
-            )
-            macro_advantages[i] = macro_advantage
-
-    # returns computation
-    macro_returns = macro_advantages + values if not calculate_micro_return else macro_advantages + values[::chunk_size]
-    # normalize advantages
-    macro_advantages = (macro_advantages - macro_advantages.mean()) / (macro_advantages.std() + 1e-8)
-    
-    if calculate_micro_return:
-        micro_returns = micro_advantages + values
-        micro_advantages = (micro_advantages - micro_advantages.mean()) / (micro_advantages.std() + 1e-8)
-    else:
-        micro_returns = None
-        micro_advantages = None
-
+    macro_returns = macro_advantages + values
+    micro_returns = micro_advantages + values if compute_micro else None
     return macro_returns, macro_advantages, micro_returns, micro_advantages
 
 
@@ -143,12 +157,25 @@ class PPO_CHUNKED(Agent):
         self.policy = self.models.get("policy", None)
         self.value = self.models.get("value", None)
 
-        # Action Chunking variables
-        self.use_residual = hasattr(self.policy, 'residual')
-        self.residual_training_step = self.cfg.residual_begin_training
+        # action chunking
+        self.use_residual = getattr(self.policy, "residual", None) is not None
+        self.residual_training_step = self.cfg.residual_begin_training or 0
         self.action_size = compute_space_size(self.action_space)
         self.chunk_size = self.cfg.action_chunk_size
-        self.use_all_states = True if self.use_residual or self.cfg.use_all_states else False
+        self.use_all_states = bool(self.use_residual or self.cfg.use_all_states)
+
+        self.ratio_clip_chunk_scaling = (self.cfg.ratio_clip_chunk_scaling or "none").lower()
+        if self.ratio_clip_chunk_scaling not in ["none", "linear", "exponential", "per_step"]:
+            raise ValueError(
+                f"Unknown ratio_clip_chunk_scaling: {self.cfg.ratio_clip_chunk_scaling} "
+                "(use None, 'linear', 'exponential' or 'per_step')"
+            )
+        self.per_step_ratio = self.ratio_clip_chunk_scaling == "per_step"
+        if self.ratio_clip_chunk_scaling == "linear" and self.cfg.ratio_clip * self.chunk_size >= 1:
+            logger.warning(
+                f"ratio_clip_chunk_scaling='linear': lower clip bound 1 - {self.chunk_size} * {self.cfg.ratio_clip} <= 0, "
+                "so decreasing the probability of negative-advantage chunks is never clipped. Consider 'exponential'"
+            )
 
         # checkpoint models
         self.checkpoint_modules["policy"] = self.policy
@@ -182,9 +209,12 @@ class PPO_CHUNKED(Agent):
             # - learning rate schedulers
             self.scheduler = self.cfg.learning_rate_scheduler[0]
             if self.scheduler is not None:
-                self.scheduler = self.cfg.learning_rate_scheduler[0](
-                    self.optimizer, **self.cfg.learning_rate_scheduler_kwargs[0]
-                )
+                scheduler_kwargs = dict(self.cfg.learning_rate_scheduler_kwargs[0])
+                # the chunk KL grows ~linearly with the number of actions per chunk: scale the target accordingly.
+                # With per-step ratios the per-action KL is used, so the threshold is kept as given
+                if self.scheduler is KLAdaptiveLR and not self.per_step_ratio:
+                    scheduler_kwargs["kl_threshold"] = scheduler_kwargs.get("kl_threshold", 0.008) * self.chunk_size
+                self.scheduler = self.cfg.learning_rate_scheduler[0](self.optimizer, **scheduler_kwargs)
 
         # set up preprocessors
         # - observations
@@ -218,64 +248,85 @@ class PPO_CHUNKED(Agent):
 
         # create tensors in memory
         if self.memory is not None:
-            # if isinstance(self.memory, RandomChunkedMemory)
-            scale = 1 if not self.use_all_states else self.chunk_size
-            # Scaled
-            self.memory.create_tensor(name="observations", size=self.observation_space, scale=scale, dtype=torch.float32)
-            self.memory.create_tensor(name="states", size=self.state_space, scale=scale, dtype=torch.float32)
-
-            self.memory.create_tensor(name="actions", size=compute_space_size(self.action_space) * self.chunk_size, dtype=torch.float32)
-            self.memory.create_tensor(name="rewards", size=self.chunk_size if scale == 1 else 1, scale=scale, dtype=torch.float32)
-
-            # Scaled
-            self.memory.create_tensor(name="terminated", size=1, scale=scale, dtype=torch.bool)
-            self.memory.create_tensor(name="truncated", size=1, scale=scale, dtype=torch.bool)
-
-            self.memory.create_tensor(name="log_prob", size=1, dtype=torch.float32)
-
-            # Scaled
-            self.memory.create_tensor(name="values", size=1, scale=scale, dtype=torch.float32)
-            self.memory.create_tensor(name="returns", size=1, scale=scale, dtype=torch.float32)
-
+            if self.memory.memory_size != self.cfg.rollouts:
+                raise ValueError(
+                    f"PPO_CHUNKED stores one entry per environment step: memory_size ({self.memory.memory_size}) "
+                    f"must equal rollouts ({self.cfg.rollouts}). Use 'memory_size: -1' in the runner config"
+                )
+            if self.cfg.rollouts < self.chunk_size:
+                logger.warning(f"rollouts ({self.cfg.rollouts}) < action_chunk_size ({self.chunk_size})")
+            A, C = self.action_size, self.chunk_size
+            self.memory.create_tensor(name="observations", size=self.observation_space, dtype=torch.float32)
+            self.memory.create_tensor(name="states", size=self.state_space, dtype=torch.float32)
+            self.memory.create_tensor(name="actions", size=A * C, dtype=torch.float32)  # chunk (at chunk starts)
+            self.memory.create_tensor(name="log_prob", size=C, dtype=torch.float32)  # per-step log-prob of the chunk
+            self.memory.create_tensor(name="chunk_starts", size=1, dtype=torch.bool)
+            self.memory.create_tensor(name="rewards", size=1, dtype=torch.float32)
+            self.memory.create_tensor(name="terminated", size=1, dtype=torch.bool)
+            self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
+            self.memory.create_tensor(name="values", size=1, dtype=torch.float32)
+            self.memory.create_tensor(name="returns", size=1, dtype=torch.float32)
             self.memory.create_tensor(name="advantages", size=1, dtype=torch.float32)
-
-            micro_sizes = [None, None, None] if not self.use_residual else [self.action_space, 1, 1]
-            # For residual
-            self.memory.create_tensor(name="micro_actions", size=micro_sizes[0], scale=scale, dtype=torch.float32) 
-            self.memory.create_tensor(name="micro_log_prob", size=micro_sizes[1], scale=scale, dtype=torch.float32)
-            self.memory.create_tensor(name="micro_advantages", size=micro_sizes[2], scale=scale, dtype=torch.float32)
-            # For using all states
-            self.memory.create_tensor(name="micro_returns", size=None if not self.use_all_states else 1, scale=scale, dtype=torch.float32)
-
-            self._tensors_names = ["observations", "states", "actions", "log_prob", "values", "returns", "advantages", "micro_actions", "micro_log_prob", "micro_returns", "micro_advantages"]
+            if self.use_residual:
+                self.memory.create_tensor(name="base_actions", size=A, dtype=torch.float32)
+                self.memory.create_tensor(name="micro_actions", size=A, dtype=torch.float32)
+                self.memory.create_tensor(name="micro_log_prob", size=1, dtype=torch.float32)
+                self.memory.create_tensor(name="micro_advantages", size=1, dtype=torch.float32)
 
         # create temporary variables needed for storage and computation
         self._current_next_observations = None
         self._current_next_states = None
-        self._current_log_prob = None
         self._current_values = None
         self._rollout = 0
-        self._outputs = None
 
-        # Create temporary variables for residual policy
+        # per-env chunk state
+        self._chunk_step = None  # (N,) index of the action of the current chunk to execute next
+        self._current_action_chunk = None  # (N, C * A)
+        self._current_mean_chunk = None  # (N, C * A)
+        self._current_step_log_prob = None  # (N, C)
+        self._current_chunk_start = None  # (N,) bool: a chunk was predicted at the current step
+
+        # residual policy
+        self._current_base_actions = None
         self._current_action_micro = None
         self._current_log_prob_micro = None
 
-        # For storing chunk stuff
-        num_envs = self.memory.tensors['terminated'].shape[1]
-        self._current_action_chunk = None
-        self._executing_action_chunk = None
-        self._stale_action_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
-        if not self.use_all_states:
-            self._chunk_observations = None
-            self._chunk_states = None
-            self._current_rewards = torch.empty(num_envs, self.chunk_size, dtype=torch.float32)
-            self._terminated = torch.empty(num_envs, self.chunk_size, dtype=torch.bool)
-            self._truncated = torch.empty(num_envs, self.chunk_size, dtype=torch.bool)
-        # num_rollouts x action_chunk_size x 1
-        # self._discount_vector = self.cfg.discount_factor ** torch.arange(self.chunk_size, device=self.device).repeat(self.memory.memory_size, 1).unsqueeze(-1)
-        # num_envs x chunk_size x 1
-        self._discount_vector = self.cfg.discount_factor ** torch.arange(self.chunk_size, device=self.device).repeat(num_envs, 1).unsqueeze(-1)
+    # ------------------------------------------------------------------ helpers
+
+    def _per_step_log_prob(self, distribution: torch.distributions.Normal, chunk: torch.Tensor) -> torch.Tensor:
+        """Log-probability of each action of a chunk: ``(B, C * A) -> (B, C)``."""
+        log_prob = distribution.log_prob(chunk)
+        return log_prob.view(*log_prob.shape[:-1], self.chunk_size, self.action_size).sum(dim=-1)
+
+    def _select_step(self, chunk: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+        """Action at (per-env) position ``step`` of each env's chunk: ``(N, C * A), (N,) -> (N, A)``."""
+        chunk = chunk.view(chunk.shape[0], self.chunk_size, self.action_size)
+        return chunk[torch.arange(chunk.shape[0], device=chunk.device), step]
+
+    def _reset_shared_cache(self) -> None:
+        """Invalidate the backbone output cached by shared models (before a value call on new inputs)."""
+        for model in (self.policy, self.value):
+            if model is None:
+                continue
+            if hasattr(model, "reset_shared_cache"):
+                model.reset_shared_cache()
+            elif hasattr(model, "_shared_output"):
+                model._shared_output = None
+
+    def _ratio_clip_bounds(self, lengths: torch.Tensor) -> tuple[float | torch.Tensor, float | torch.Tensor]:
+        """Clip range of the chunk ratio given the number of executed actions per chunk ``(B,)``."""
+        eps = self.cfg.ratio_clip
+        if self.ratio_clip_chunk_scaling in ["none", "per_step"]:
+            return 1.0 - eps, 1.0 + eps
+        L = lengths.unsqueeze(-1).to(torch.float32)
+        if self.ratio_clip_chunk_scaling == "linear":
+            return 1.0 - eps * L, 1.0 + eps * L
+        return (1.0 - eps) ** L, (1.0 + eps) ** L
+
+    def _residual_active(self, timestep: int) -> bool:
+        return self.use_residual and (timestep >= self.residual_training_step or not self.training)
+
+    # ------------------------------------------------------------------ interaction
 
     def act(
         self, observations: torch.Tensor, states: torch.Tensor | None, *, timestep: int, timesteps: int
@@ -295,61 +346,65 @@ class PPO_CHUNKED(Agent):
             "states": self._state_preprocessor(states),
         }
         # sample random actions
-        # TODO, check for stochasticity
         if timestep < self.cfg.random_timesteps:
             return self.policy.random_act(inputs, role="policy")
 
-        # sample stochastic actions
+        num_envs = observations.shape[0]
+        if self._chunk_step is None or self._chunk_step.shape[0] != num_envs:
+            self._chunk_step = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+            self._current_action_chunk = None
+        # every rollout starts with a fresh chunk for all envs so that no chunk spans two updates
+        if self.training and self._rollout % self.cfg.rollouts == 0:
+            self._chunk_step.zero_()
+
         with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-            chunk_ind = self._rollout % self.chunk_size
-            if chunk_ind == 0:
-                actions, self._outputs = self.policy.act(inputs, role="policy")
-                self._current_log_prob = self._outputs["log_prob"]
-                self._current_action_chunk = actions
-                # self._executing_action_chunk = actions.clone()
-                self._stale_action_mask.zero_()
-            # Don't zero out actions
-            # else:
-            #     if self._stale_action_mask.any():
-            #         reset_envs = self._stale_action_mask.nonzero(as_tuple=True)[0]
-            #         with torch.no_grad():
-            #             new_actions, _ = self.policy.act(inputs, role='policy')
+            # predict a new chunk for the envs whose chunk is exhausted or whose episode just ended
+            need_new = self._chunk_step == 0
+            policy_called = bool(need_new.any())
+            if policy_called:
+                chunk, outputs = self.policy.act(inputs, role="policy")
+                step_log_prob = self._per_step_log_prob(self.policy.distribution(role="policy"), chunk)
+                mean_chunk = outputs["mean_actions"]
+                if self._current_action_chunk is None or bool(need_new.all()):
+                    self._current_action_chunk = chunk
+                    self._current_mean_chunk = mean_chunk
+                    self._current_step_log_prob = step_log_prob
+                else:
+                    mask = need_new.unsqueeze(-1)
+                    self._current_action_chunk = torch.where(mask, chunk, self._current_action_chunk)
+                    self._current_mean_chunk = torch.where(mask, mean_chunk, self._current_mean_chunk)
+                    self._current_step_log_prob = torch.where(mask, step_log_prob, self._current_step_log_prob)
+            self._current_chunk_start = need_new
 
-            #         start_idx = chunk_ind * self.action_size
-            #         self._executing_action_chunk[reset_envs, start_idx:] = new_actions[reset_envs, start_idx:]
+            actions = self._select_step(self._current_action_chunk, self._chunk_step)
+            self._current_base_actions = actions
 
-            # actions = self._executing_action_chunk[:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
-            actions = self._current_action_chunk[:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
-            if self.use_residual and (timestep >= self.residual_training_step or not self.training):
+            # residual (per-step) correction
+            residual_active = self._residual_active(timestep)
+            if residual_active:
                 residual_actions, residual_outputs = self.policy.act(
-                    {"observations":torch.cat((inputs['observations'], actions), dim=-1)}, 
-                    role="residual"
+                    {"observations": torch.cat((inputs["observations"], actions), dim=-1)}, role="residual"
                 )
-                self._current_log_prob_micro = residual_outputs['log_prob']
+                self._current_log_prob_micro = residual_outputs["log_prob"]
                 self._current_action_micro = residual_actions
                 actions = actions + residual_actions
 
-            # Zero out actions
-            # # If an environment has ended, make sure no actions are taken
-            env_actions = actions.clone()
-            env_actions[self._stale_action_mask] = 0.0
-
-            # compute values
-            if self.training and (self.use_all_states or chunk_ind == 0):
+            # compute values (every step: needed to bootstrap chunks that start at any step)
+            if self.training:
+                if not policy_called:
+                    self._reset_shared_cache()
                 values, _ = self.value.act(inputs, role="value")
                 self._current_values = self._value_preprocessor(values, inverse=True)
+                return actions, {}
 
-            # When training, outputs isn't used during rollouts
-            if self.training:
-                outputs = None
-            else:
-                outputs = copy.deepcopy(self._outputs)
-                outputs['mean_actions'] = self._outputs['mean_actions'][:, chunk_ind*self.action_size:(chunk_ind+1)*self.action_size]
-                if self.use_residual:
-                    outputs['mean_actions'] += residual_outputs['mean_actions']
-                    outputs['mean_actions'] = residual_outputs['mean_actions']
-                self._rollout += 1
-        return actions, outputs
+            # evaluation: deterministic actions (mean chunk action + mean residual for that mean action)
+            mean_actions = self._select_step(self._current_mean_chunk, self._chunk_step)
+            if residual_active:
+                _, residual_mean_outputs = self.policy.act(
+                    {"observations": torch.cat((inputs["observations"], mean_actions), dim=-1)}, role="residual"
+                )
+                mean_actions = mean_actions + residual_mean_outputs["mean_actions"]
+        return actions, {"mean_actions": mean_actions}
 
     def record_transition(
         self,
@@ -394,7 +449,7 @@ class PPO_CHUNKED(Agent):
             timesteps=timesteps,
         )
 
-        if self.training:
+        if self.training and self._chunk_step is not None:
             self._current_next_observations = next_observations
             self._current_next_states = next_states
 
@@ -409,53 +464,39 @@ class PPO_CHUNKED(Agent):
                         "observations": self._observation_preprocessor(next_observations),
                         "states": self._state_preprocessor(next_states),
                     }
+                    self._reset_shared_cache()
                     next_values, _ = self.value.act(inputs, role="value")
                     next_values = self._value_preprocessor(next_values, inverse=True)
+                rewards = rewards + self.cfg.discount_factor * next_values * truncated
 
-                rewards[..., -1:] += (self.cfg.discount_factor**rewards.shape[-1]) * next_values * truncated
-
-            # storage transition in memory
-            chunk_ind = self._rollout % self.chunk_size
-            self._stale_action_mask |= (terminated | truncated).squeeze(-1)
-            if self.use_all_states:
-                # If using all states, add in the step by step data (observations, states, rewards, values, terminated, truncated)
-                residuals = {} if not (self.use_residual and timestep >= self.residual_training_step) else {'micro_actions':self._current_action_micro, 'micro_log_prob':self._current_log_prob_micro}
-                self.memory.add_samples(
-                    observations=observations,
-                    states=states,
-                    rewards=rewards,
-                    terminated=terminated,
-                    truncated=truncated,
-                    values=self._current_values,
-                    **residuals
+            tensors = dict(
+                observations=observations,
+                states=states,
+                actions=self._current_action_chunk,
+                log_prob=self._current_step_log_prob,
+                chunk_starts=self._current_chunk_start.unsqueeze(-1),
+                rewards=rewards,
+                terminated=terminated,
+                truncated=truncated,
+                values=self._current_values,
+            )
+            if self.use_residual and timestep >= self.residual_training_step:
+                tensors.update(
+                    base_actions=self._current_base_actions,
+                    micro_actions=self._current_action_micro,
+                    micro_log_prob=self._current_log_prob_micro,
                 )
-                # Add in other data when it is the correct time (actions, log_prob)
-                if chunk_ind == 0:
-                    self.memory.add_samples(
-                        inc_memory_index=True,
-                        actions=self._current_action_chunk,
-                        log_prob=self._current_log_prob,
-                    )
+            if isinstance(self.memory, RandomChunkedMemory):
+                self.memory.add_samples(inc_memory_index=True, **tensors)
             else:
-                self._terminated[:, chunk_ind] = terminated.squeeze(-1)
-                self._truncated[:, chunk_ind] = truncated.squeeze(-1)
-                self._current_rewards[:, chunk_ind] = rewards.squeeze(-1)
-                if chunk_ind == 0:
-                    self._chunk_observations = observations
-                    self._chunk_states = states
-                # If the policy is about to predict again, add to the samples
-                if chunk_ind == self.chunk_size - 1:
-                    self.memory.add_samples(
-                        inc_memory_index=True,
-                        observations=self._chunk_observations,
-                        states=self._chunk_states,
-                        actions=self._current_action_chunk,
-                        rewards=self._current_rewards,
-                        terminated=torch.any(self._terminated, dim=-1, keepdim=True),
-                        truncated=torch.any(self._truncated, dim=-1, keepdim=True),
-                        log_prob=self._current_log_prob,
-                        values=self._current_values,
-                    )
+                self.memory.add_samples(**tensors)
+
+        # advance each env's position in its chunk. Envs whose chunk is exhausted or whose episode just ended
+        # (the env has been reset: the rest of the old chunk is discarded) predict a new chunk at the next step
+        if self._chunk_step is not None:
+            done = (terminated | truncated).view(-1).to(self._chunk_step.device)
+            self._chunk_step += 1
+            self._chunk_step[(self._chunk_step >= self.chunk_size) | done] = 0
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         """Method called before the interaction with the environment.
@@ -482,10 +523,12 @@ class PPO_CHUNKED(Agent):
 
         # write tracking data and checkpoints
         super().post_interaction(timestep=timestep, timesteps=timesteps)
-    
+
     def explained_variance(self, y_pred, y_true):
         var_y = torch.var(y_true)
         return torch.nan if var_y == 0 else 1 - torch.var(y_true - y_pred) / var_y
+
+    # ------------------------------------------------------------------ update
 
     def update(self, *, timestep: int, timesteps: int) -> None:
         """Algorithm's main update step.
@@ -493,137 +536,199 @@ class PPO_CHUNKED(Agent):
         :param timestep: Current timestep.
         :param timesteps: Number of timesteps.
         """
+        C, A = self.chunk_size, self.action_size
+
         # compute returns and advantages
         with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
             inputs = {
                 "observations": self._observation_preprocessor(self._current_next_observations),
                 "states": self._state_preprocessor(self._current_next_states),
             }
+            self._reset_shared_cache()
             self.value.enable_training_mode(False)
             last_values, _ = self.value.act(inputs, role="value")
             self.value.enable_training_mode(True)
             last_values = self._value_preprocessor(last_values, inverse=True)
 
-        # memory holds stuff as shape [num_rollout_steps, batch, size]
         values = self.memory.get_tensor_by_name("values")
-        returns, advantages, micro_returns, micro_advantages = compute_gae(
+        chunk_starts = self.memory.get_tensor_by_name("chunk_starts")
+        chunk_lengths = compute_chunk_lengths(chunk_starts)
+        macro_returns, macro_advantages, micro_returns, micro_advantages = compute_gae(
             rewards=self.memory.get_tensor_by_name("rewards"),
             terminated=self.memory.get_tensor_by_name("terminated"),
             truncated=self.memory.get_tensor_by_name("truncated"),
             values=values,
             last_values=last_values,
+            chunk_starts=chunk_starts,
             discount_factor=self.cfg.discount_factor,
             lambda_coefficient=self.cfg.gae_lambda,
             time_limit_bootstrap=self.cfg.time_limit_bootstrap,
-            chunk_size=self.chunk_size,
-            discount_vector=self._discount_vector,
-            calculate_micro_return=self.use_all_states
+            compute_micro=self.use_all_states,
         )
 
-        self.memory.set_tensor_by_name("values", self._value_preprocessor(values, train=True))
-        if not self.use_all_states:
-            self.memory.set_tensor_by_name("returns", self._value_preprocessor(returns, train=True))
-            explained_variance = self.explained_variance(self.memory.get_tensor_by_name("values"), self.memory.get_tensor_by_name("returns")).item()
-        else:
-            self.memory.set_tensor_by_name("micro_returns", self._value_preprocessor(micro_returns, train=True))
-            explained_variance = self.explained_variance(self.memory.get_tensor_by_name("values"), self.memory.get_tensor_by_name("micro_returns")).item()
-        self.memory.set_tensor_by_name("advantages", advantages)
+        start_mask = chunk_starts.squeeze(-1)  # (T, N)
+        # normalize the chunk advantages (over chunk starts only)
+        start_advantages = macro_advantages[start_mask]
+        macro_advantages[start_mask] = (start_advantages - start_advantages.mean()) / (start_advantages.std() + 1e-8)
 
-        if self.use_residual:
+        # value targets: every step (micro returns) or chunk starts only (macro returns)
+        if self.use_all_states:
+            value_mask = torch.ones_like(start_mask)
+            returns = micro_returns
+        else:
+            value_mask = start_mask
+            returns = macro_returns
+        explained_variance = self.explained_variance(values[value_mask], returns[value_mask])
+        explained_variance = explained_variance.item() if isinstance(explained_variance, torch.Tensor) else explained_variance
+
+        processed_values = values.clone()
+        processed_values[value_mask] = self._value_preprocessor(values[value_mask], train=True)
+        processed_returns = returns.clone()
+        processed_returns[value_mask] = self._value_preprocessor(returns[value_mask], train=True)
+        self.memory.set_tensor_by_name("values", processed_values)
+        self.memory.set_tensor_by_name("returns", processed_returns)
+        self.memory.set_tensor_by_name("advantages", macro_advantages)
+
+        # the residual is trained once a full rollout has been collected with it acting
+        train_residual = self.use_residual and (timestep - self.cfg.rollouts + 1 >= self.residual_training_step)
+        if train_residual:
+            micro_advantages = (micro_advantages - micro_advantages.mean()) / (micro_advantages.std() + 1e-8)
             self.memory.set_tensor_by_name("micro_advantages", micro_advantages)
+
+        # flat (t * num_envs + env) indices into memory.tensors_view
+        views = self.memory.tensors_view
+        chunk_indexes = start_mask.reshape(-1).nonzero().squeeze(-1)
+        value_indexes = value_mask.reshape(-1).nonzero().squeeze(-1)
+        flat_lengths = chunk_lengths.view(-1)
+        step_range = torch.arange(C, device=flat_lengths.device)
+
+        def get(name, indexes):
+            return views[name][indexes] if name in views else None
 
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
         cumulative_avg_kl = 0
+        num_updates = 0
+        policy_distribution = None
 
         # learning epochs
         for epoch in range(self.cfg.learning_epochs):
             kl_divergences = []
 
+            chunk_permutation = torch.randperm(chunk_indexes.numel(), device=chunk_indexes.device)
+            chunk_batches = chunk_indexes[chunk_permutation].tensor_split(self.cfg.mini_batches)
+            if self.use_all_states:
+                value_permutation = torch.randperm(value_indexes.numel(), device=value_indexes.device)
+                value_batches = value_indexes[value_permutation].tensor_split(self.cfg.mini_batches)
+            else:
+                value_batches = chunk_batches  # same rows: shared models can reuse the policy's backbone output
+
             # mini-batches loop
-            for (
-                sampled_observations,
-                sampled_states,
-                sampled_actions,
-                sampled_log_prob,
-                sampled_values,
-                sampled_returns,
-                sampled_advantages,
-                sampled_micro_actions,
-                sampled_micro_log_prob,
-                sampled_micro_returns,
-                sampled_micro_advantages,
-            ) in self.memory.sample(
-                names=self._tensors_names, batch_size=len(self.memory), mini_batches=self.cfg.mini_batches, chunk_size=1 if not self.use_all_states else self.chunk_size,
-            ):
+            for chunk_batch, value_batch in zip(chunk_batches, value_batches):
+                if chunk_batch.numel() == 0:
+                    continue
 
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
-                    inputs = {
-                        "observations": self._observation_preprocessor(sampled_observations, train=not epoch),
-                        "states": self._state_preprocessor(sampled_states, train=not epoch),
-                    }
-                    if not self.use_all_states:
-                        _, outputs = self.policy.act({**inputs, "taken_actions": sampled_actions}, role="policy")
+                    if self.use_all_states:
+                        value_inputs = {
+                            "observations": self._observation_preprocessor(
+                                get("observations", value_batch), train=not epoch
+                            ),
+                            "states": self._state_preprocessor(get("states", value_batch), train=not epoch),
+                        }
+                        chunk_inputs = {
+                            "observations": self._observation_preprocessor(get("observations", chunk_batch)),
+                            "states": self._state_preprocessor(get("states", chunk_batch)),
+                        }
                     else:
-                        _, outputs = self.policy.act({'observations':inputs['observations'][::self.chunk_size], "taken_actions": sampled_actions}, role="policy")
-                        if hasattr(self.policy, '_shared_output'):
-                            self.policy._shared_output = None
-                        if self.use_residual and timestep >= self.residual_training_step:
-                            _, micro_outputs = self.policy.act(
-                                {
-                                    'observations':torch.cat((inputs['observations'], sampled_actions.view(-1, self.action_size)), dim=-1), 
-                                    "taken_actions": sampled_micro_actions
-                                }, 
-                                role="residual"
-                            )
-                    # TODO: Should I take the average log prob across each chunk?
-                    next_log_prob = outputs["log_prob"] #/ self.chunk_size
-                    # sampled_log_prob = sampled_log_prob / self.chunk_size
+                        chunk_inputs = {
+                            "observations": self._observation_preprocessor(
+                                get("observations", chunk_batch), train=not epoch
+                            ),
+                            "states": self._state_preprocessor(get("states", chunk_batch), train=not epoch),
+                        }
+                        value_inputs = chunk_inputs
 
-                    # compute approximate KL divergence
+                    # chunk policy: log-probability of the executed part of each chunk
+                    sampled_chunks = get("actions", chunk_batch)
+                    self.policy.act({**chunk_inputs, "taken_actions": sampled_chunks}, role="policy")
+                    policy_distribution = self.policy.distribution(role="policy")
+                    if self.use_all_states:
+                        self._reset_shared_cache()
+
+                    lengths = flat_lengths[chunk_batch]
+                    executed = (step_range < lengths.unsqueeze(-1)).to(torch.float32)  # (B, C)
+                    num_executed = executed.sum()
+                    # per-action log-ratios of the executed actions (0 for the non-executed ones)
+                    step_log_ratio = (
+                        self._per_step_log_prob(policy_distribution, sampled_chunks) - get("log_prob", chunk_batch)
+                    ) * executed
+                    log_ratio = step_log_ratio.sum(dim=-1, keepdim=True)  # chunk log-ratio
+
+                    # compute approximate KL divergence (per action for per-step ratios, per chunk otherwise)
                     with torch.no_grad():
-                        ratio = next_log_prob - sampled_log_prob
-                        kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
+                        if self.per_step_ratio:
+                            kl = ((torch.exp(step_log_ratio) - 1) - step_log_ratio) * executed
+                            kl_divergence = kl.sum() / num_executed
+                        else:
+                            kl_divergence = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
                         kl_divergences.append(kl_divergence)
 
                     # early stopping with KL divergence
                     if self.cfg.kl_threshold and kl_divergence > self.cfg.kl_threshold:
                         break
 
-                    # compute entropy loss
+                    # compute entropy loss (executed actions only)
                     if self.cfg.entropy_loss_scale:
-                        entropy_loss = -self.cfg.entropy_loss_scale * self.policy.get_entropy(role="policy").mean()
+                        entropy = policy_distribution.entropy()
+                        entropy = (entropy.view(-1, C, A).sum(dim=-1) * executed).sum(dim=-1)
+                        entropy_loss = -self.cfg.entropy_loss_scale * entropy.mean()
                     else:
                         entropy_loss = 0
 
                     # compute policy loss
-                    ratio = torch.exp(next_log_prob - sampled_log_prob)
-                    surrogate = sampled_advantages * ratio
-                    surrogate_clipped = sampled_advantages * torch.clip(
-                        ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
-                    )
-                    policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+                    sampled_advantages = get("advantages", chunk_batch)
+                    lower, upper = self._ratio_clip_bounds(lengths)
+                    if self.per_step_ratio:
+                        # each executed action is clipped individually; the chunk advantage is shared by its actions
+                        ratio = torch.exp(step_log_ratio)  # (B, C)
+                        surrogate = sampled_advantages * ratio
+                        surrogate_clipped = sampled_advantages * torch.clamp(ratio, min=lower, max=upper)
+                        policy_loss = -(torch.min(surrogate, surrogate_clipped) * executed).sum() / num_executed
+                    else:
+                        ratio = torch.exp(log_ratio)  # (B, 1)
+                        surrogate = sampled_advantages * ratio
+                        surrogate_clipped = sampled_advantages * torch.clamp(ratio, min=lower, max=upper)
+                        policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
 
-                    # Compute residual loss (if using)
-                    if self.use_residual and timestep >= self.residual_training_step:
-                        next_log_prob_micro = micro_outputs['log_prob']
-                        micro_ratio = torch.exp(next_log_prob_micro - sampled_micro_log_prob)
+                    # residual (per-step) policy loss
+                    if train_residual:
+                        _, micro_outputs = self.policy.act(
+                            {
+                                "observations": torch.cat(
+                                    (value_inputs["observations"], get("base_actions", value_batch)), dim=-1
+                                ),
+                                "taken_actions": get("micro_actions", value_batch),
+                            },
+                            role="residual",
+                        )
+                        sampled_micro_advantages = get("micro_advantages", value_batch)
+                        micro_ratio = torch.exp(micro_outputs["log_prob"] - get("micro_log_prob", value_batch))
                         micro_surrogate = sampled_micro_advantages * micro_ratio
                         micro_surrogate_clipped = sampled_micro_advantages * torch.clip(
                             micro_ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
                         )
-                        micro_policy_loss = -torch.min(micro_surrogate, micro_surrogate_clipped).mean()
-                        policy_loss += micro_policy_loss
+                        policy_loss = policy_loss - torch.min(micro_surrogate, micro_surrogate_clipped).mean()
 
                     # compute value loss
-                    predicted_values, _ = self.value.act(inputs, role="value")
-
+                    predicted_values, _ = self.value.act(value_inputs, role="value")
+                    sampled_values = get("values", value_batch)
                     if self.cfg.value_clip > 0:
                         predicted_values = sampled_values + torch.clip(
                             predicted_values - sampled_values, min=-self.cfg.value_clip, max=self.cfg.value_clip
                         )
-                    value_loss = self.cfg.value_loss_scale * F.mse_loss(sampled_returns if not self.use_all_states else sampled_micro_returns, predicted_values)
+                    value_loss = self.cfg.value_loss_scale * F.mse_loss(get("returns", value_batch), predicted_values)
 
                 # optimization step
                 self.optimizer.zero_grad()
@@ -647,11 +752,14 @@ class PPO_CHUNKED(Agent):
                 self.scaler.update()
 
                 # update cumulative losses
+                num_updates += 1
                 cumulative_policy_loss += policy_loss.item()
                 cumulative_value_loss += value_loss.item()
                 if self.cfg.entropy_loss_scale:
                     cumulative_entropy_loss += entropy_loss.item()
-            cumulative_avg_kl += torch.tensor(kl_divergences, device=self.device).mean().item()
+
+            if kl_divergences:
+                cumulative_avg_kl += torch.tensor(kl_divergences, device=self.device).mean().item()
             # update learning rate
             if self.scheduler:
                 if isinstance(self.scheduler, KLAdaptiveLR):
@@ -665,17 +773,16 @@ class PPO_CHUNKED(Agent):
                     self.scheduler.step()
 
         # record data
-        self.track_data(
-            "Loss / Policy loss", cumulative_policy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
-        )
-        self.track_data("Loss / Value loss", cumulative_value_loss / (self.cfg.learning_epochs * self.cfg.mini_batches))
+        num_updates = max(num_updates, 1)
+        self.track_data("Loss / Policy loss", cumulative_policy_loss / num_updates)
+        self.track_data("Loss / Value loss", cumulative_value_loss / num_updates)
         self.track_data("Loss / Explained Variance", explained_variance)
         if self.cfg.entropy_loss_scale:
-            self.track_data(
-                "Loss / Entropy loss", cumulative_entropy_loss / (self.cfg.learning_epochs * self.cfg.mini_batches)
-            )
+            self.track_data("Loss / Entropy loss", cumulative_entropy_loss / num_updates)
 
-        self.track_data("Policy / Standard deviation", self.policy.distribution(role="policy").stddev.mean().item())
+        if policy_distribution is not None:
+            self.track_data("Policy / Standard deviation", policy_distribution.stddev.mean().item())
+        self.track_data("Policy / Mean executed chunk length", flat_lengths[chunk_indexes].float().mean().item())
         self.track_data("Learning / Avg KL", cumulative_avg_kl / self.cfg.learning_epochs)
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])

@@ -1,3 +1,5 @@
+# pyright: reportIndexIssue=false, reportOptionalSubscript=false
+
 from __future__ import annotations
 
 from typing import Any
@@ -16,6 +18,7 @@ from skrl.memories.jax import Memory
 from skrl.models.jax import Model
 from skrl.resources.optimizers.jax import Adam
 from skrl.utils import ScopedTimer
+from skrl.utils.framework.jax.types import Device, Tensor
 
 from .sac_cfg import SAC_CFG
 
@@ -27,13 +30,13 @@ def _update_critic(
     critic_1_state_dict,
     critic_2_act,
     critic_2_state_dict,
-    target_q1_values: jax.Array,
-    target_q2_values: jax.Array,
+    target_q1_values: Tensor,
+    target_q2_values: Tensor,
     entropy_coefficient,
     next_log_prob,
-    inputs: dict[str, jax.Array],
-    sampled_rewards: jax.Array,
-    sampled_terminated: jax.Array,
+    inputs: dict[str, Tensor],
+    sampled_rewards: Tensor,
+    sampled_terminated: Tensor,
     discount_factor: float,
 ):
     # compute target values
@@ -46,14 +49,21 @@ def _update_critic(
         critic_loss = ((critic_values - target_values) ** 2).mean()
         return critic_loss, critic_values
 
-    (critic_1_loss, critic_1_values), grad = jax.value_and_grad(_critic_loss, has_aux=True)(
+    (critic_1_loss, critic_1_values), critic_1_grad = jax.value_and_grad(_critic_loss, has_aux=True)(
         critic_1_state_dict.params, critic_1_act, "critic_1"
     )
-    (critic_2_loss, critic_2_values), grad = jax.value_and_grad(_critic_loss, has_aux=True)(
+    (critic_2_loss, critic_2_values), critic_2_grad = jax.value_and_grad(_critic_loss, has_aux=True)(
         critic_2_state_dict.params, critic_2_act, "critic_2"
     )
 
-    return grad, (critic_1_loss + critic_2_loss) / 2, critic_1_values, critic_2_values, target_values
+    return (
+        critic_1_grad,
+        critic_2_grad,
+        (critic_1_loss + critic_2_loss) / 2,
+        critic_1_values,
+        critic_2_values,
+        target_values,
+    )
 
 
 @functools.partial(jax.jit, static_argnames=("policy_act", "critic_1_act", "critic_2_act"))
@@ -102,7 +112,7 @@ class SAC(Agent):
         observation_space: gymnasium.Space | None = None,
         state_space: gymnasium.Space | None = None,
         action_space: gymnasium.Space | None = None,
-        device: str | jax.Device | None = None,
+        device: Device = None,
         cfg: SAC_CFG | dict = {},
     ) -> None:
         """Soft Actor-Critic (SAC).
@@ -131,11 +141,11 @@ class SAC(Agent):
         )
 
         # models
-        self.policy = self.models.get("policy", None)
-        self.critic_1 = self.models.get("critic_1", None)
-        self.critic_2 = self.models.get("critic_2", None)
-        self.target_critic_1 = self.models.get("target_critic_1", None)
-        self.target_critic_2 = self.models.get("target_critic_2", None)
+        self.policy = self.models.get("policy")
+        self.critic_1 = self.models.get("critic_1")
+        self.critic_2 = self.models.get("critic_2")
+        self.target_critic_1 = self.models.get("target_critic_1")
+        self.target_critic_2 = self.models.get("target_critic_2")
 
         # checkpoint models
         self.checkpoint_modules["policy"] = self.policy
@@ -216,13 +226,9 @@ class SAC(Agent):
             self.policy_scheduler = self.cfg.learning_rate_scheduler[0]
             self.critic_scheduler = self.cfg.learning_rate_scheduler[1]
             if self.policy_scheduler is not None:
-                self.policy_scheduler = self.cfg.learning_rate_scheduler[0](
-                    **self.cfg.learning_rate_scheduler_kwargs[0]
-                )
+                self.policy_scheduler = self.policy_scheduler(**self.cfg.learning_rate_scheduler_kwargs[0])
             if self.critic_scheduler is not None:
-                self.critic_scheduler = self.cfg.learning_rate_scheduler[1](
-                    **self.cfg.learning_rate_scheduler_kwargs[1]
-                )
+                self.critic_scheduler = self.critic_scheduler(**self.cfg.learning_rate_scheduler_kwargs[1])
 
         # set up target networks
         if self.target_critic_1 is not None and self.target_critic_2 is not None:
@@ -287,8 +293,8 @@ class SAC(Agent):
             self.target_critic_2.apply = jax.jit(self.target_critic_2.apply, static_argnums=2)
 
     def act(
-        self, observations: jax.Array, states: jax.Array | None, *, timestep: int, timesteps: int
-    ) -> tuple[jax.Array, dict[str, Any]]:
+        self, observations: Tensor, states: Tensor | None, *, timestep: int, timesteps: int
+    ) -> tuple[Tensor, dict[str, Any]]:
         """Process the environment's observations/states to make a decision (actions) using the main policy.
 
         :param observations: Environment observations.
@@ -315,14 +321,14 @@ class SAC(Agent):
     def record_transition(
         self,
         *,
-        observations: jax.Array,
-        states: jax.Array,
-        actions: jax.Array,
-        rewards: jax.Array,
-        next_observations: jax.Array,
-        next_states: jax.Array,
-        terminated: jax.Array,
-        truncated: jax.Array,
+        observations: Tensor,
+        states: Tensor,
+        actions: Tensor,
+        rewards: Tensor,
+        next_observations: Tensor,
+        next_states: Tensor,
+        terminated: Tensor,
+        truncated: Tensor,
         infos: Any,
         timestep: int,
         timesteps: int,
@@ -404,6 +410,7 @@ class SAC(Agent):
         """
 
         # gradient steps
+        entropy_loss = None
         for gradient_step in range(self.cfg.gradient_steps):
 
             # sample a batch from memory
@@ -438,7 +445,7 @@ class SAC(Agent):
             )
 
             # compute critic loss
-            grad, critic_loss, critic_1_values, critic_2_values, target_values = _update_critic(
+            critic_1_grad, critic_2_grad, critic_loss, critic_1_values, critic_2_values, target_values = _update_critic(
                 self.critic_1.act,
                 self.critic_1.state_dict,
                 self.critic_2.act,
@@ -455,16 +462,17 @@ class SAC(Agent):
 
             # optimization step (critic)
             if config.jax.is_distributed:
-                grad = self.critic_1.reduce_parameters(grad)
+                critic_1_grad = self.critic_1.reduce_parameters(critic_1_grad)
+                critic_2_grad = self.critic_2.reduce_parameters(critic_2_grad)
             self.critic_1_optimizer = self.critic_1_optimizer.step(
-                grad=grad, model=self.critic_1, lr=self.critic_learning_rate if self.critic_scheduler else None
+                grad=critic_1_grad, model=self.critic_1, lr=self.critic_learning_rate if self.critic_scheduler else None
             )
             self.critic_2_optimizer = self.critic_2_optimizer.step(
-                grad=grad, model=self.critic_2, lr=self.critic_learning_rate if self.critic_scheduler else None
+                grad=critic_2_grad, model=self.critic_2, lr=self.critic_learning_rate if self.critic_scheduler else None
             )
 
             # compute policy (actor) loss
-            grad, policy_loss, log_prob = _update_policy(
+            policy_grad, policy_loss, log_prob = _update_policy(
                 self.policy.act,
                 self.critic_1.act,
                 self.critic_2.act,
@@ -477,20 +485,22 @@ class SAC(Agent):
 
             # optimization step (policy)
             if config.jax.is_distributed:
-                grad = self.policy.reduce_parameters(grad)
+                policy_grad = self.policy.reduce_parameters(policy_grad)
             self.policy_optimizer = self.policy_optimizer.step(
-                grad=grad, model=self.policy, lr=self.policy_learning_rate if self.policy_scheduler else None
+                grad=policy_grad, model=self.policy, lr=self.policy_learning_rate if self.policy_scheduler else None
             )
 
             # entropy learning
             if self.cfg.learn_entropy:
                 # compute entropy loss
-                grad, entropy_loss = _update_entropy(
+                entropy_grad, entropy_loss = _update_entropy(
                     self.log_entropy_coefficient.state_dict, self._target_entropy, log_prob
                 )
 
                 # optimization step (entropy)
-                self.entropy_optimizer = self.entropy_optimizer.step(grad=grad, model=self.log_entropy_coefficient)
+                self.entropy_optimizer = self.entropy_optimizer.step(
+                    grad=entropy_grad, model=self.log_entropy_coefficient
+                )
 
                 # compute entropy coefficient
                 self._entropy_coefficient = jnp.exp(self.log_entropy_coefficient.value)
